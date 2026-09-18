@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+clean-ocr - remove the most common Tesseract artifacts from OCR'd text.
+
+Scanned books produce a small, very regular set of junk that is easy to
+strip without touching real text: page-edge shadows and marginal rules
+read as a lone '|', '_' or quote mark at the start or end of a line, dust
+read as a line consisting of nothing but punctuation, and so on.
+
+Reads a file (or stdin) and writes the cleaned text to stdout. The rules
+are deliberately conservative; every one of them targets a pattern that
+does not occur in ordinary running text:
+
+  1. drop lines that contain no letter or digit at all (e.g. "'", "_", "— |."),
+     except that a line consisting of just "*" is treated by rule 4;
+  2. strip a leading stray mark followed by a space, e.g. "_ Verhef U"
+     or "‚ wij zullen" -> "Verhef U", "wij zullen"; the mark must be one of
+     _ ‚ | ' ‘ . , ; : ! -- an opening quote that is attached to its word
+     ("'t", ”Hij) is left alone;
+  3. strip a trailing " |" or " _" (the right-hand page edge);
+  4. re-attach a stranded "*" line to the end of the previous line (half-verse
+     markers in psalters and hymnals, footnote markers elsewhere);
+  5. strip trailing whitespace and collapse runs of blank lines to one.
+
+Page markers written by ocr-pdf -m (e.g. "=== page 12 ===") contain digits and
+are therefore never dropped by rule 1; choose a marker that contains a letter
+or digit if you use a custom one.
+
+Usage: clean-ocr [FILE] > cleaned.txt
+       clean-ocr -s [FILE]      # only print what would change, as a diff
+"""
+
+import difflib
+import re
+import sys
+
+LEAD_JUNK = re.compile(r"^[_‚|'‘.,;:!]+\s+(?=\S)")
+TRAIL_JUNK = re.compile(r"\s+[|_‚]+$")
+ALNUM = re.compile(r"[^\W_]", re.UNICODE)   # any letter or digit
+
+
+def clean(lines):
+    out = []
+    blank_pending = False
+    for raw in lines:
+        line = raw.rstrip()
+
+        if line.strip() == "*":                                 # rule 4
+            for i in range(len(out) - 1, -1, -1):
+                if out[i]:
+                    out[i] = out[i] + " *"
+                    break
+            continue
+
+        if line and not ALNUM.search(line):                     # rule 1
+            continue
+
+        line = LEAD_JUNK.sub("", line)                          # rule 2
+        line = TRAIL_JUNK.sub("", line)                         # rule 3
+
+        if not line:                                            # rule 5
+            blank_pending = bool(out)
+            continue
+        if blank_pending:
+            out.append("")
+            blank_pending = False
+        out.append(line)
+    return out
+
+
+def main(argv):
+    show_diff = False
+    args = []
+    for a in argv:
+        if a == "-s":
+            show_diff = True
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            args.append(a)
+    if len(args) > 1:
+        print("clean-ocr: expected at most one file", file=sys.stderr)
+        return 2
+
+    src = open(args[0], encoding="utf-8") if args else sys.stdin
+    with src:
+        original = src.read().splitlines()
+    cleaned = clean(original)
+
+    if show_diff:
+        sys.stdout.writelines(difflib.unified_diff(
+            [l + "\n" for l in original], [l + "\n" for l in cleaned],
+            "original", "cleaned", n=0))
+    else:
+        sys.stdout.write("\n".join(cleaned) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

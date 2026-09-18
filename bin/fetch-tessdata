@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+#
+# fetch-tessdata - download Tesseract language models into a local directory.
+#
+# MacPorts (and Homebrew) install the Tesseract engine without language data.
+# Rather than requiring `sudo port install tesseract-<lang>` for every language
+# you ever need, this script downloads the official traineddata files into a
+# project-local directory that ocr-pdf points Tesseract at via TESSDATA_PREFIX.
+#
+# Usage: fetch-tessdata [-d DIR] [-s best|fast|std] LANG [LANG ...]
+#
+#   -d DIR   target directory            (default: $TESSDATA_DIR or ./tessdata)
+#   -s SET   which model set to download (default: best)
+#              best - tessdata_best: most accurate, float LSTM models (~10-15 MB)
+#              fast - tessdata_fast: integer models, faster, slightly less accurate
+#              std  - tessdata:      legacy + LSTM combined, supports --oem 0
+#   LANG     ISO 639-2 code as used by Tesseract, e.g. nld, eng, ell, deu, chu.
+#            'nld+eng' is accepted and split on '+'. Already-present files are
+#            skipped unless -f is given.
+#   -f       force re-download
+#
+# Also fetches pdf.ttf (needed by Tesseract's searchable-PDF renderer) if absent.
+
+set -euo pipefail
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dir="${TESSDATA_DIR:-$script_dir/../tessdata}"
+set_name="best"
+force=0
+
+while getopts ":d:s:fh" opt; do
+  case "$opt" in
+    d) dir="$OPTARG" ;;
+    s) set_name="$OPTARG" ;;
+    f) force=1 ;;
+    h) usage 0 ;;
+    :) echo "error: -$OPTARG requires an argument" >&2; usage 2 ;;
+    \?) echo "error: unknown option -$OPTARG" >&2; usage 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "error: no language given" >&2; usage 2; }
+
+case "$set_name" in
+  best) repo="tessdata_best" ;;
+  fast) repo="tessdata_fast" ;;
+  std)  repo="tessdata" ;;
+  *) echo "error: -s must be best, fast or std (got '$set_name')" >&2; exit 2 ;;
+esac
+
+base="https://github.com/tesseract-ocr/$repo/raw/main"
+mkdir -p "$dir"
+dir="$(cd "$dir" && pwd)"
+
+fetch() {  # fetch URL DEST
+  local tmp="$2.part"
+  echo "  downloading $(basename "$2") ..." >&2
+  if ! curl -fsSL --retry 3 -o "$tmp" "$1"; then
+    rm -f "$tmp"
+    echo "error: download failed: $1" >&2
+    return 1
+  fi
+  mv "$tmp" "$2"
+}
+
+for arg in "$@"; do
+  # split 'nld+eng' style arguments
+  for lang in $(echo "$arg" | tr '+' ' '); do
+    dest="$dir/$lang.traineddata"
+    if [ -s "$dest" ] && [ "$force" -eq 0 ]; then
+      echo "  $lang: already present ($dest)" >&2
+      continue
+    fi
+    fetch "$base/$lang.traineddata" "$dest"
+  done
+done
+
+# pdf.ttf is a tiny glyphless font Tesseract embeds in searchable PDFs.
+# Tesseract looks for it next to the language data, so put a copy here too.
+if [ ! -s "$dir/pdf.ttf" ]; then
+  sys_ttf="$(tesseract --list-langs 2>&1 | sed -n 's/.*in "\(.*\)".*/\1/p' | head -1)"
+  if [ -n "$sys_ttf" ] && [ -s "$sys_ttf/pdf.ttf" ]; then
+    cp "$sys_ttf/pdf.ttf" "$dir/pdf.ttf"
+  else
+    fetch "https://github.com/tesseract-ocr/tesseract/raw/main/tessdata/pdf.ttf" "$dir/pdf.ttf"
+  fi
+fi
+
+echo "language data in $dir:" >&2
+TESSDATA_PREFIX="$dir" tesseract --list-langs 2>&1 | tail -n +2 | sed 's/^/  /' >&2

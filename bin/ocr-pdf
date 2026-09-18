@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# ocr-pdf - OCR a (scanned) PDF into plain text with Tesseract.
+#
+# Pipeline: pdftoppm renders each page to a greyscale PNG, Tesseract OCRs the
+# pages in parallel, and the per-page results are concatenated into one text
+# file. Every intermediate is cached under the work directory, so re-running
+# after a crash, or with a wider page range, only does the missing work.
+#
+# Usage: ocr-pdf [options] FILE.pdf
+#
+#   -l LANG     Tesseract language(s), '+'-separated for mixed text   [eng]
+#               Missing models are downloaded with fetch-tessdata.
+#   -r DPI      render resolution                                     [300]
+#   -p PSM      Tesseract page segmentation mode (3 = auto layout,
+#               4 = single column, 6 = single uniform block)          [3]
+#   -f N        first page                                            [1]
+#   -t N        last page                                             [last]
+#   -j N        parallel jobs                                         [CPU count]
+#   -o DIR      output directory                          [out/<basename>]
+#   -w DIR      work (cache) directory                    [work/<basename>]
+#   -m FMT      visible page marker written before each page, printf
+#               style with %d = page number, e.g. '=== page %d ==='.
+#               Default: none; pages are separated by a form feed (\f)
+#               like pdftotext does.
+#   -P ARGS     ImageMagick operations applied to each rendered page
+#               before OCR, e.g. '-threshold 60% -morphology Open Square:1'
+#   -q N        render pages as JPEG at quality N instead of lossless PNG.
+#               Use with -s: Tesseract embeds the page image as-is, so
+#               JPEG pages give a searchable PDF a fraction of the size.
+#   -c KEY=VAL  extra Tesseract config variable (repeatable)
+#   -s          also produce a searchable PDF (image + invisible text layer)
+#   -C          also write <basename>.clean.txt, run through clean-ocr
+#   -F          force: discard cached renders and OCR results first
+#   -h          this help
+#
+# Environment:
+#   TESSDATA_DIR  where language models live            [<repo>/tessdata]
+#
+# Output: <outdir>/<basename>.txt, plus <basename>.clean.txt with -C and
+# <basename>.pdf with -s. Per-page text lives in <workdir>/ocr/page-NNNN.txt
+# next to the rendered images in <workdir>/img/, handy for proofreading.
+
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+die()   { echo "ocr-pdf: error: $*" >&2; exit 1; }
+log()   { echo "==> $*" >&2; }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$script_dir/.." && pwd)"
+
+ocr_lang="eng"
+dpi=300
+psm=3
+first=1
+last=""
+jobs="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+outdir=""
+workdir=""
+marker=""
+magick_args=""
+jpeg_quality=""
+configs=""
+make_pdf=0
+make_clean=0
+force=0
+
+while getopts ":l:r:p:f:t:j:o:w:m:P:q:c:sCFh" opt; do
+  case "$opt" in
+    l) ocr_lang="$OPTARG" ;;
+    r) dpi="$OPTARG" ;;
+    p) psm="$OPTARG" ;;
+    f) first="$OPTARG" ;;
+    t) last="$OPTARG" ;;
+    j) jobs="$OPTARG" ;;
+    o) outdir="$OPTARG" ;;
+    w) workdir="$OPTARG" ;;
+    m) marker="$OPTARG" ;;
+    P) magick_args="$OPTARG" ;;
+    q) jpeg_quality="$OPTARG" ;;
+    c) configs="$configs -c $OPTARG" ;;
+    s) make_pdf=1 ;;
+    C) make_clean=1 ;;
+    F) force=1 ;;
+    h) usage 0 ;;
+    :) echo "error: -$OPTARG requires an argument" >&2; usage 2 ;;
+    \?) echo "error: unknown option -$OPTARG" >&2; usage 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || { echo "error: expected exactly one PDF" >&2; usage 2; }
+
+pdf="$1"
+[ -r "$pdf" ] || die "cannot read '$pdf'"
+name="$(basename "$pdf" .pdf)"
+name="$(basename "$name" .PDF)"
+outdir="${outdir:-$root/out/$name}"
+workdir="${workdir:-$root/work/$name}"
+tessdata="${TESSDATA_DIR:-$root/tessdata}"
+
+# --- prerequisites ---------------------------------------------------------
+
+for tool in pdfinfo pdftoppm tesseract xargs; do
+  command -v "$tool" >/dev/null || die "'$tool' not found (poppler and tesseract are required)"
+done
+[ -n "$magick_args" ] && { command -v magick >/dev/null || die "'magick' (ImageMagick 7) needed for -P"; }
+[ "$make_pdf" -eq 1 ] && { command -v pdfunite >/dev/null || die "'pdfunite' (poppler) needed for -s"; }
+
+for lang in $(echo "$ocr_lang" | tr '+' ' '); do
+  [ -s "$tessdata/$lang.traineddata" ] || "$script_dir/fetch-tessdata" -d "$tessdata" "$lang"
+done
+[ "$make_pdf" -eq 1 ] && [ ! -s "$tessdata/pdf.ttf" ] && "$script_dir/fetch-tessdata" -d "$tessdata" "$ocr_lang"
+export TESSDATA_PREFIX="$tessdata"
+
+# --- page range ------------------------------------------------------------
+
+pages="$(pdfinfo "$pdf" | awk '/^Pages:/ {print $2}')"
+[ -n "$pages" ] || die "could not determine page count of '$pdf'"
+last="${last:-$pages}"
+[ "$first" -ge 1 ] && [ "$last" -le "$pages" ] && [ "$first" -le "$last" ] \
+  || die "page range $first-$last outside 1-$pages"
+
+# --- cache directories, invalidated when the settings that produced them change
+
+imgdir="$workdir/img"
+ocrdir="$workdir/ocr"
+if [ -n "$jpeg_quality" ]; then imgext="jpg"; else imgext="png"; fi
+render_stamp="dpi=$dpi format=$imgext quality=[$jpeg_quality] magick=[$magick_args] pdftoppm=$(pdftoppm -v 2>&1 | head -1)"
+ocr_stamp="lang=$ocr_lang psm=$psm configs=[$configs] $(tesseract --version 2>&1 | head -1) render={$render_stamp}"
+
+prepare_cache() {  # prepare_cache DIR STAMP
+  if [ "$force" -eq 1 ] || { [ -f "$1/.stamp" ] && [ "$(cat "$1/.stamp")" != "$2" ]; }; then
+    log "settings changed, clearing $1"
+    rm -rf "$1"
+  fi
+  mkdir -p "$1"
+  echo "$2" > "$1/.stamp"
+}
+prepare_cache "$imgdir" "$render_stamp"
+prepare_cache "$ocrdir" "$ocr_stamp"
+mkdir -p "$outdir"
+
+# --- per-page workers, run under xargs -P ----------------------------------
+
+export PDF="$pdf" IMGDIR="$imgdir" OCRDIR="$ocrdir" DPI="$dpi" PSM="$psm" \
+       OCR_LANG="$ocr_lang" MAGICK_ARGS="$magick_args" CONFIGS="$configs" MAKE_PDF="$make_pdf" \
+       IMGEXT="$imgext" JPEG_QUALITY="$jpeg_quality"
+
+render_page() {
+  local n="$1" id fmt
+  id="$(printf 'page-%04d' "$n")"
+  [ -s "$IMGDIR/$id.$IMGEXT" ] && return 0
+  if [ "$IMGEXT" = "jpg" ]; then fmt="-jpeg -jpegopt quality=$JPEG_QUALITY"; else fmt="-png"; fi
+  # shellcheck disable=SC2086
+  pdftoppm -singlefile -f "$n" -l "$n" -r "$DPI" -gray $fmt "$PDF" "$IMGDIR/$id.tmp" \
+    || { echo "render failed: page $n" >&2; return 1; }
+  if [ -n "$MAGICK_ARGS" ]; then
+    # shellcheck disable=SC2086  # intentional word splitting of user-supplied args
+    magick "$IMGDIR/$id.tmp.$IMGEXT" $MAGICK_ARGS "$IMGDIR/$id.$IMGEXT" \
+      || { echo "preprocess failed: page $n" >&2; return 1; }
+    rm -f "$IMGDIR/$id.tmp.$IMGEXT"
+  else
+    mv "$IMGDIR/$id.tmp.$IMGEXT" "$IMGDIR/$id.$IMGEXT"
+  fi
+}
+
+ocr_page() {
+  local n="$1" id extra=""
+  id="$(printf 'page-%04d' "$n")"
+  if [ "$MAKE_PDF" -eq 1 ]; then
+    [ -f "$OCRDIR/$id.txt" ] && [ -f "$OCRDIR/$id.pdf" ] && return 0
+    extra="-c tessedit_create_pdf=1"
+  else
+    [ -f "$OCRDIR/$id.txt" ] && return 0
+  fi
+  # Write under a temporary name and rename on success, so that an existing
+  # page-NNNN.txt always means "finished" (blank pages give empty files).
+  # shellcheck disable=SC2086
+  tesseract "$IMGDIR/$id.$IMGEXT" "$OCRDIR/$id.tmp" -l "$OCR_LANG" --psm "$PSM" \
+      -c tessedit_create_txt=1 $extra $CONFIGS >"$OCRDIR/$id.log" 2>&1 \
+    || { rm -f "$OCRDIR/$id.tmp".*; echo "ocr failed: page $n (see $OCRDIR/$id.log)" >&2; return 1; }
+  mv "$OCRDIR/$id.tmp.txt" "$OCRDIR/$id.txt"
+  [ "$MAKE_PDF" -eq 1 ] && mv "$OCRDIR/$id.tmp.pdf" "$OCRDIR/$id.pdf"
+  return 0
+}
+export -f render_page ocr_page
+
+page_list() { seq "$first" "$last"; }
+
+log "$name: pages $first-$last of $pages, $dpi dpi, lang=$ocr_lang, psm=$psm, $jobs jobs"
+
+todo="$(page_list | while read -r n; do [ -s "$imgdir/$(printf 'page-%04d' "$n").$imgext" ] || echo "$n"; done | wc -l | tr -d ' ')"
+log "rendering $todo page(s) -> $imgdir"
+page_list | xargs -P "$jobs" -n 1 bash -c 'render_page "$@"' _ || die "rendering failed"
+
+todo="$(page_list | while read -r n; do id="$ocrdir/$(printf 'page-%04d' "$n")"; [ -f "$id.txt" ] && { [ "$make_pdf" -eq 0 ] || [ -f "$id.pdf" ]; } || echo "$n"; done | wc -l | tr -d ' ')"
+log "OCR of $todo page(s) -> $ocrdir"
+page_list | xargs -P "$jobs" -n 1 bash -c 'ocr_page "$@"' _ || die "OCR failed"
+
+# --- assemble --------------------------------------------------------------
+
+txt="$outdir/$name.txt"
+log "writing $txt"
+{
+  sep=""
+  for n in $(page_list); do
+    id="$(printf 'page-%04d' "$n")"
+    if [ -n "$marker" ]; then
+      # shellcheck disable=SC2059  # the marker is a user-supplied printf format
+      printf "$marker\n" "$n"
+    else
+      printf '%s' "$sep"; sep=$'\f'
+    fi
+    # Tesseract ends each page with a form feed; strip that and trailing blanks.
+    tr -d '\f' < "$ocrdir/$id.txt" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+  done
+} > "$txt"
+
+if [ "$make_pdf" -eq 1 ]; then
+  out_pdf="$outdir/$name.pdf"
+  log "writing $out_pdf"
+  page_pdfs=()
+  for n in $(page_list); do page_pdfs+=("$ocrdir/$(printf 'page-%04d' "$n").pdf"); done
+  pdfunite "${page_pdfs[@]}" "$out_pdf"
+fi
+
+if [ "$make_clean" -eq 1 ]; then
+  clean="$outdir/$name.clean.txt"
+  log "writing $clean"
+  "$script_dir/clean-ocr" "$txt" > "$clean"
+fi
+
+log "done: $(wc -l < "$txt" | tr -d ' ') lines, $(wc -w < "$txt" | tr -d ' ') words in $txt"
