@@ -1,19 +1,38 @@
-# OCR from a phone photo
+# OCR from phone photos
 
-How `bin/prep-photo` and `clean-ocr -a` came about: a phone photo of a printed
-page that Tesseract could not read as-is, the techniques that were on the
-table, what the photo really needed, every experiment with its measured
-result, the final pipeline, and what is still wrong with it.
+How `bin/prep-photo`, `clean-ocr -a` and `bin/ocr-photo` came about. Part 1
+starts from one phone photo of a printed page that Tesseract could not read
+as-is: the techniques that were on the table, what the photo really needed,
+every experiment with its measured result, and the pipeline that came out of
+it. Part 2 takes that pipeline to thirteen more photos and eight scanned
+pages, where it fell short, and replaces its line finding with Kraken's; it
+also fine-tunes a Kraken recognition model and combines it with Tesseract.
+[SESSION-LOG.md](SESSION-LOG.md) has the chronological account, with the
+problems met on the way and the commands.
 
 ## Contents
 
+Part 1: one photo, Tesseract
 - [The photo](#the-photo)
 - [Techniques on the table](#techniques-on-the-table)
 - [What the photo actually looks like](#what-the-photo-actually-looks-like)
 - [How results were measured](#how-results-were-measured)
 - [Experiment log](#experiment-log)
-- [The final pipeline](#the-final-pipeline)
-- [The result](#the-result)
+- [The prep-photo pipeline](#the-prep-photo-pipeline)
+- [The result of part 1](#the-result-of-part-1)
+
+Part 2: fourteen photos, eight scans, and Kraken
+- [The material](#the-material)
+- [Part 1's pipeline on the new pages](#part-1s-pipeline-on-the-new-pages)
+- [Kraken's recognition, off the shelf](#krakens-recognition-off-the-shelf)
+- [Kraken's lines, Tesseract's reading](#krakens-lines-tesseracts-reading)
+- [Fine-tuning Kraken](#fine-tuning-kraken)
+- [Combining the two readings](#combining-the-two-readings)
+- [Fine-tuning Tesseract](#fine-tuning-tesseract)
+- [The ocr-photo pipeline](#the-ocr-photo-pipeline)
+- [Results](#results)
+
+Both parts
 - [Limitations](#limitations)
 - [Ideas for later](#ideas-for-later)
 - [Reproducing](#reproducing)
@@ -279,7 +298,7 @@ band (0.52) lies 45 px below, outside the ±1u comparison window.
 
 The total stayed at 1.29% at best, so the parameters were left as they are.
 
-## The final pipeline
+## The prep-photo pipeline
 
 **`bin/prep-photo`**, per photo. `u` is the median height of the ink blobs of
 at least 30 px (38 px here).
@@ -320,10 +339,10 @@ TESSDATA_PREFIX=tessdata tesseract work/<name>/prep.png - -l nld --psm 4 \
     -c 'tessedit_char_blacklist={}!|' | bin/clean-ocr -a
 ```
 
-## The result
+## The result of part 1
 
-`out/20251128_143633/20251128_143633.clean.txt`, CER 1.29%. The 13 remaining
-edits:
+CER 1.29% on the first photo (that output has since been replaced by
+`bin/ocr-photo`'s, 0.4%). The 13 remaining edits:
 
 | Transcription | OCR | Cause |
 |---------------|-----|-------|
@@ -333,53 +352,361 @@ edits:
 | `[4] Van` | `[4] van` | capital lost |
 | `bezingen,` | `bezingen, <` | a mark that survived at the line end |
 
+## The material
+
+- **14 phone photos** (`photos/`), all from the same binder, taken within
+  three minutes with a Samsung SM-T220 tablet: two blurred by camera shake
+  (143653, 143749), one strongly angled with small print, several with the
+  binder's punched holes or a dark hand shadow in the picture, and all with
+  the same kind of reader's marks (stress marks, red underlines, a few pencil
+  corrections and pasted correction slips). Transcribed:
+  `out/<name>/<name>.gt.txt`, 347 lines, 14,318 characters. Only the first
+  photo is in the repository (Git LFS); the others are git-ignored to save
+  LFS storage, so the transcriptions and outputs of those are committed but
+  the photos themselves stay local.
+- **8 scanned pages** from `pdf/liturgie.pdf` (pages 16–17 and 21–26; the
+  other pages are mostly musical notation): the same kind of pages with the
+  same kind of marks, but as sharp 296 dpi scans. The PDF has no text layer.
+  Transcribed: `out/liturgie-pNN/liturgie-pNN.gt.txt`, 132 lines, 4,549
+  characters. These pages are never trained on, which makes them the fairest
+  test of anything trained on the photos.
+
+Transcriptions follow the print, not the reader's corrections (`zonden man`
+where a pen changed it to `zonder`), keep misprints (`verbied`, `hour`,
+`aallerzuiverst`), and leave out the marks, margin notes and slips.
+`experiments/photo-ocr/evalset.py` scores any run against all of them, per
+group.
+
+## Part 1's pipeline on the new pages
+
+| Pipeline | Photos | Scans |
+|----------|--------|-------|
+| `tesseract --psm 4` on the EXIF-rotated image | 11.84% | 9.69% |
+| `prep-photo`, `tesseract --psm 4`, `clean-ocr -a` | 6.54% | 2.68% |
+
+Per photo, part 1's pipeline ranged from 1.1% to 25.8%. The failures were
+almost all in *finding lines*: Tesseract's page layout analysis merged lines
+of different sizes, split lines at binder holes, read shadows and holes as
+text, and on the blurred photos lost whole lines of small print.
+
+## Kraken's recognition, off the shelf
+
+Two public Kraken models were tried on the first photo, with Kraken's own
+segmentation (`kraken … segment -bl ocr -m MODEL`):
+
+| Model | Rotated photo | `prep.png` |
+|-------|---------------|------------|
+| McCATMuS (print, handwriting and typescript, 16th–21st century) | 16.7% | 14.8% |
+| CATMuS-Print Large | 4.8% | 7.2% |
+| (part 1: `prep-photo` + Tesseract) | | 1.3% |
+
+On seven photos CATMuS-Print scored 8.1% against 7.5% for part 1's pipeline:
+better on the two blurred photos, worse on all others. Neither model knows
+this modern sans-serif well (`Gu` for `Gij`, `rn` for `m`), and neither
+ignores the marks. But **Kraken's segmentation found every line** on every
+photo, including the blurred and the angled ones.
+
+## Kraken's lines, Tesseract's reading
+
+So the two were combined: Kraken finds and straightens the lines, Tesseract
+reads each line on its own (`--psm 7`, a single text line), so that its page
+layout analysis is never used. Getting the line images right took several
+steps (photos / scans):
+
+| Step | Photos | Scans |
+|------|--------|-------|
+| Kraken's line images as they come (black outside the line polygon) | 16.3% | |
+| white instead of black outside the polygon, from an exact mask | 3.69% | |
+| baselines lengthened by 0.4 line heights at both ends, polygons extended under the baseline | 3.27% | 2.42% |
+| lines with almost no letters dropped | 3.12% | 1.47% |
+| lines read from the image with only the lighting flattened | **2.65%** | **1.47%** |
+
+- **Black borders.** Kraken fills everything outside a line's polygon with
+  black. On a faint, blurred line that black dominates Tesseract's threshold
+  and the text vanishes (one blurred photo went to 77% CER). The same
+  extraction applied to an all-white image gives the exact "outside" mask;
+  whitening it plus 2 px (the mask's edge is anti-aliased) fixed it.
+- **Cut-off punctuation.** blla ends a baseline at the last letter, and the
+  line polygon hugs the letters: a line-final `,` or `.` falls outside the
+  image, and the polygon's lower edge clips comma tails into full stops.
+  Lengthening the baselines, recomputing the polygons with Kraken's own
+  polygonizer, and adding a strip under the baseline (0.35 of the line's own
+  height) brought them back. A plain fixed-height band around every baseline
+  was worse, because print sizes vary on a page.
+- **Junk lines.** Kraken also finds "lines" in page edges, binder holes and
+  shadows. Tesseract's word confidence does not separate them from real text
+  (dropping lines below 40 already cost real text), but they are all tiny:
+  lines with fewer than 3 letters, or fewer than 8 at a confidence below 55,
+  are dropped. That removed 30 lines in 22 pages, all junk.
+- **Reading from a gentler image.** On blurred photos prep-photo's red-ink
+  and mark removal ate into letters where underlines ran into them, and once
+  erased a faint word. Lines are still *found* on the cleaned image, where
+  the marks are gone, but *read* from the image with only the lighting
+  flattened (`prep-photo --flat`): 3.12% → 2.65% on the photos, no change on
+  the scans. Reading from an image with the red removed but the marks kept
+  gave 2.88%.
+
+This is `bin/ocr-photo`.
+
+## Fine-tuning Kraken
+
+In the akafist project a Kraken model trained on the book's own lines beat
+everything else. Here:
+
+**Training lines.** `experiments/photo-ocr/build_lines.py` cuts the lines
+exactly as Kraken's recogniser sees them at reading time and pairs each with
+its transcription line (Tesseract's reading, similarity ≥ 0.6, each line
+used once, lengths must agree). 328 lines are usable; 13 where the reader's
+pen changed a letter or a correction slip covers text are left out of
+training, because the image no longer shows what the transcription says.
+The base model is CATMuS-Print Large, fine-tuned with ketos on the CPU (the
+Mac's GPU hung).
+
+**Held-out photos.** The photos were split into two halves of seven, A and
+B; a model trained on the lines of one half is scored only on the seven
+photos of the other half.
+
+**Real lines only.** Trained on 167 lines of one half, the model reached 99%
+on its validation lines but 4.9% on the other seven photos (Tesseract hybrid
+at the time: 3.0%), and the model trained on all 328 lines read the sharp
+scans at 7.8%: it had learnt blurred photo lines, and confused `rn`/`m`,
+`ri`/`n` and `f`/`l` with high confidence. The akafist model had about 50
+times more lines.
+
+**Synthetic lines.** `experiments/photo-ocr/synth.py` renders lines of
+Psalterion text (same register, not the text of any test page) in the pages'
+typeface, Arial, with stress-mark strokes and underlines on random vowels,
+at blur levels from sharp to very blurred, grey ink, noise, and Kraken's
+black border. With 4,000 of these plus the real lines of one half (four
+times over), the model read the scans at 2.4% after one epoch instead of
+7.8%. Its best result on its seven unseen photos was 4.3%, on the scans
+1.9%; the Tesseract hybrid remains better on its own. The validation score
+(30 real photo lines) did not predict the scan score: epoch 2 was better
+on the scans than epoch 4.
+
+## Combining the two readings
+
+Tesseract and the fine-tuned Kraken model make different mistakes. Per
+line, where the readings differ, the one with more words found in a Dutch
+vocabulary wins (score: known words minus half the unknown ones; the
+vocabulary is that of the Psalterion text; stress accents are ignored); ties
+go to Tesseract, and so do Kraken readings with a mean character confidence
+below 80. With the half-A model on its seven unseen photos and on the scans:
+
+| | Unseen photos (7) | Scans |
+|-|-------------------|-------|
+| Tesseract hybrid (`ocr-photo`) | 2.51% | 1.47% |
+| fine-tuned Kraken alone | 4.47% | 2.40% |
+| combined (`ocr-photo -m`) | **2.30%** | **1.32%** |
+
+Kraken's reading was kept on 21 of 302 lines.
+
+The production model, `models/liturgie-print.safetensors`, is trained the
+same way on the lines of all fourteen photos (298 real lines four times over
+plus the 4,000 synthetic ones, 30 real lines for validation, 4 epochs, the
+checkpoint with the best validation accuracy: 99.2%). It is git-ignored
+(23 MB); the training commands are in SESSION-LOG.md, part 3. Only the scans
+can test it: alone it reads them at 1.45%, combined with stock Tesseract
+(`ocr-photo -m`) at 1.30%, against 1.47% for Tesseract alone.
+
+A caveat found later: the "vocabulary" is that of the Psalterion *OCR text*,
+which contains OCR junk (`ee`, `pe`, `se`, `eee`), so some garbage counts as
+known words. The comparison still works because both readings are judged by
+the same list, but a cleaner list should do better.
+
+## Fine-tuning Tesseract
+
+Tesseract's model is a container that can be unpacked (`combine_tessdata
+-u`): the neural network (3.3 MB, spec
+`[1,36,0,1Ct3,3,16Mp3,3Lfys64Lfx96Lrx96Lfx192O1c1]`, itself trained in 2017
+on synthetic lines, `synth20170629`), the 151 characters it knows, and three
+dictionaries (a 478,341-word Dutch word list, punctuation and number
+patterns) that its decoder searches with. The network cannot usefully be
+loaded into Kraken: there is no converter, and without the dictionary search
+it would be a weaker Tesseract. But Tesseract can be fine-tuned itself, with
+`tesstrain`, on the same kind of lines: `build_lines.py --tesseract` cuts them
+as `ocr-photo` gives them to Tesseract (from `flat.png`, white around them),
+`synth.py --white` renders synthetic ones without Kraken's black border, and
+`experiments/photo-ocr/train_tesseract.sh` does the rest (8,000 iterations
+from `nld`: 5 to 9 minutes on one core, after 1 to 4 minutes of preparing the
+line files).
+
+Two things mattered:
+
+- **The dictionary.** tesstrain builds the new model *without* a dictionary
+  unless word lists are supplied. Unpacking `nld`'s dictionaries into word
+  lists (`dawg2wordlist`) and building the model with them keeps it.
+- **Junk lines.** The fine-tuned model reads a page edge as a long string of
+  letters (`Vee ee pe: SE ee een Genee …`), too long for the "few letters"
+  junk rule, but at a confidence of 23–33 where every real line is above 48
+  (and above 30 with the stock model). `ocr-photo` now also drops lines
+  below 30.
+
+Half A's seven unseen photos and the scans, with models trained on half B:
+
+| Tesseract model | Unseen photos (7) | Scans |
+|-----------------|-------------------|-------|
+| `nld`, stock | 2.51% | 1.47% |
+| fine-tuned, without dictionary | 2.12% | 1.19% |
+| fine-tuned, with `nld`'s dictionary | **1.85%** | 1.28% |
+| … combined with the fine-tuned Kraken model (`-m`) | 1.81% | |
+
+The production model, `nld_lit`, is trained on all fourteen photos with the
+dictionary. On the scans, which it has never seen, it reads **0.86%**, against
+1.47% for stock `nld`; combining it with the Kraken model no longer helps
+(0.88%). It is installed as `tessdata/nld_lit.traineddata` (git-ignored, like
+all of `tessdata/`) and used with `bin/ocr-photo -l nld_lit`.
+
+What remains on the scans: capitals after a stress mark (`Was`, `Van`,
+`Want`, `Uit`: a pen stroke above a lower-case letter looks like the top of a
+capital, and the model has learnt that too well), headings (`toon 7` read as
+`toon /`), and letters overwritten in pen (`pet graf`).
+
+## The ocr-photo pipeline
+
+Per image:
+
+1. `bin/prep-photo` writes `work/<name>/prep.png` (steps 1–6 of part 1) and
+   `work/<name>/flat.png` (steps 1–3 only: lighting flattened, page masked),
+   both at the same scale.
+2. Kraken's baseline segmenter (blla, the default model) runs on `prep.png`.
+   Every baseline is lengthened by 0.4 median line heights at both ends
+   (kept 8 px inside the image, where the polygonizer otherwise fails), the
+   line polygons are recomputed, and each polygon is joined with a strip
+   below its baseline of 0.35 times its own mean height. Where the
+   polygonizer still fails, blla's own line is kept.
+3. Each line is cut out of `flat.png` and straightened (Kraken's
+   `extract_polygons`); everything outside the polygon, plus 2 px, is made
+   white.
+4. Tesseract reads each line: `--psm 7 -l nld`, characters `{}!|` excluded,
+   in parallel.
+5. Lines with fewer than 3 letters, fewer than 8 at a mean word confidence
+   below 55, or any line below 30, are dropped.
+6. With `-m MODEL`: the Kraken model reads the same lines from `prep.png`
+   (as it was trained), and per line the better reading is kept (above).
+7. `out/<name>/<name>.txt`, and `<name>.clean.txt` through `clean-ocr -a`;
+   `work/<name>/lines.json` with every line's geometry and readings.
+
+About 15 seconds a page on this Mac (10 cores in use), a few more with `-m`.
+
+## Results
+
+| Pipeline | Photos (14) | Scans (8) |
+|----------|-------------|-----------|
+| `tesseract --psm 4`, EXIF-rotated image | 11.84% | 9.69% |
+| part 1: `prep-photo` + `tesseract --psm 4` + `clean-ocr -a` | 6.54% | 2.68% |
+| `ocr-photo` | 2.65% | 1.47% |
+| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken) | 2.30%* | 1.30% |
+| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.85%* | **0.86%** |
+
+\* The production models are trained on all fourteen photos, so on the photos
+only the half-A models can be measured, on the seven photos they did not see
+(`ocr-photo` scores 2.51% on those seven).
+
+The photos' remaining errors are concentrated on the two blurred ones
+(143653: 8.2%, 143749: 7.3%, most of it in small print); the other twelve
+are at 1.54% together. The typical remaining errors are
+punctuation (`L:` read as `L.`, a final `,` as `.`), capitals after a stress
+mark (`Opgestaan`), `//` read as `Il`, and single letters in blurred small
+print.
+
 ## Limitations
 
-- **One photo.** All parameters were tuned on a single photo, so expect to
-  adjust them on the next ones. `bin/cer` and a transcription make that
-  quick.
-- **The line model is density-based.** It works for full lines and is
-  fragile where a line is short and has marks nearby. It has no notion of
-  baselines.
-- **Touching marks** stay in the image. `clean-ocr -a` then also strips
-  genuine accents (`café`), which is why it is opt-in.
+- **One book's print.** Everything was tuned and trained on pages from one
+  binder, in Arial with the same kind of marks. Other typefaces need their
+  own synthetic lines (`synth.py` takes any font) and, for the Kraken model,
+  their own transcribed lines.
+- **Blurred photos stay hard.** The two shaken photos are at 7–8% even now,
+  most of it in small print; no preprocessing recovers detail that is not in
+  the picture. Retake them.
+- **Touching marks** stay in the image and come out as accents or capitals
+  (`Opgestaan`). `clean-ocr -a` strips the accents but also genuine ones
+  (`café`), which is why it is opt-in.
 - **Only red** ink is recognised by colour. Pens of other colours count as
   dark marks.
-- **No perspective correction or dewarping.** Fine for a hand-held shot of a
-  flat page, not for a book photographed at an angle.
+- **No perspective correction or dewarping.** Kraken's lines follow slanted
+  and slightly curved text, which covers hand-held photos of flat pages, but
+  not a thick book photographed at an angle.
 - **Burnt-out glare** cannot be recovered.
 - **The blacklist** forbids real `!` and `{`.
+- **The lexicon** for combining readings is the Psalterion's vocabulary; a
+  text with a different vocabulary needs its own (`--lexicon`).
+- **Small test sets**: 14 photos and 8 scans, 18,867 characters. Differences
+  of a tenth of a percent are within noise.
 
 ## Ideas for later
 
-- **Baselines from Kraken:** take the line positions from Kraken's baseline
-  segmenter (`kraken … segment -bl`, available in `~/.venvs/kraken`) instead
-  of ink density, and derive the x-height band from the ink relative to each
-  baseline. That removes both known failure modes.
-- **Perspective correction** from the text itself (baselines and left
-  margin), for photos taken at an angle.
-- **Multi-shot glare removal:** a per-pixel minimum of two registered shots
-  with the light from different sides.
-- **Keeping the marks:** if the stress and chant marks are wanted, a Kraken
+- **More real training lines.** The Kraken model is trained on 328 real
+  lines; akafist's had 16,799. Correcting `ocr-photo` output for more pages
+  is now quick, and every corrected page adds about 25 lines.
+- **Train on the scans too**, once there are other scans to test on.
+- **A clean lexicon** for `-m`: the Psalterion vocabulary filtered through
+  `nld`'s word list, or the corrected transcriptions.
+- **Stress marks and capitals.** Synthetic lines with marks above *capital*
+  letters too might stop the fine-tuned Tesseract from capitalising after a
+  mark.
+- **Keeping the marks:** if the stress and chant marks are wanted, a
   recognition model trained with the marks transcribed as combining
   characters.
-- **More test photos with transcriptions**, to tune against more than one
-  page.
+- **Multi-shot glare removal:** a per-pixel minimum of two registered shots
+  with the light from different sides.
 
 ## Reproducing
 
+Setup (once):
+
 ```sh
 python3 -m pip install --user numpy Pillow opencv-python-headless
-bin/fetch-tessdata nld                        # if tessdata/nld.traineddata is missing
+python3 -m venv ~/.venvs/kraken && ~/.venvs/kraken/bin/pip install kraken
+bin/fetch-tessdata nld
+~/.venvs/kraken/bin/kraken get 10.5281/zenodo.10592716     # CATMuS-Print Large, only for training
+```
+
+Part 1, the first photo:
+
+```sh
 bin/prep-photo -d photos/20251128_143633.jpg  # -> work/20251128_143633/prep.png, debug.png
 TESSDATA_PREFIX=tessdata tesseract work/20251128_143633/prep.png - -l nld --psm 4 \
-    -c 'tessedit_char_blacklist={}!|' > out/20251128_143633/20251128_143633.txt
-bin/clean-ocr -a out/20251128_143633/20251128_143633.txt > out/20251128_143633/20251128_143633.clean.txt
-bin/cer -d out/20251128_143633/20251128_143633.gt.txt out/20251128_143633/*.clean.txt
+    -c 'tessedit_char_blacklist={}!|' | bin/clean-ocr -a > /tmp/part1.txt
+bin/cer -d out/20251128_143633/20251128_143633.gt.txt /tmp/part1.txt      # 1.29%
+```
+
+Part 2, all pages:
+
+```sh
+mkdir -p work/liturgie                        # the eight scanned pages as images
+for p in 16 17 21 22 23 24 25 26; do
+  pdfimages -j -f $p -l $p pdf/liturgie.pdf work/liturgie/tmp && mv work/liturgie/tmp-000.jpg work/liturgie/liturgie-p$p.jpg
+done
+bin/ocr-photo photos/*.jpg work/liturgie/*.jpg
+experiments/photo-ocr/evalset.py              # photos 2.65%, scans 1.47%
+bin/ocr-photo -m models/liturgie-print.safetensors work/liturgie/*.jpg   # model: see training below
+experiments/photo-ocr/evalset.py              # scans: see Results
+```
+
+Training the Kraken model (about 15 minutes an epoch on the CPU):
+
+```sh
+~/.venvs/kraken/bin/python experiments/photo-ocr/build_lines.py work/kraken-lines $(ls photos | sed 's/\.jpg$//')
+python3 experiments/photo-ocr/synth.py 4000 work/kraken-synth
+# training and validation lists, and the ketos and ketos convert commands: SESSION-LOG.md, part 3
+# (the model, models/liturgie-print.safetensors, is git-ignored: 23 MB)
+```
+
+Fine-tuning Tesseract (setup of the training tools: see the script's header):
+
+```sh
+~/.venvs/kraken/bin/python experiments/photo-ocr/build_lines.py --tesseract work/tess-lines $(ls photos | sed 's/\.jpg$//')
+python3 experiments/photo-ocr/synth.py --white 4000 work/tess-synth
+experiments/photo-ocr/train_tesseract.sh --holdout A nld_lit_A     # half A left out, for testing
+experiments/photo-ocr/train_tesseract.sh nld_lit                   # all photos -> tessdata/nld_lit.traineddata
+bin/ocr-photo -l nld_lit --out /tmp/nld_lit work/liturgie/*.jpg
+experiments/photo-ocr/evalset.py '/tmp/nld_lit/{}.clean.txt'      # scans 0.86%
 ```
 
 Environment of the measurements: macOS; Python 3.11.6 with numpy 2.4.6,
 Pillow 12.3.0 and opencv-python-headless 5.0.0; Tesseract 5.5.3 with
-Leptonica 1.87.0 and the `nld` "best" model. The ImageMagick `magick` binary
+Leptonica 1.87.0 and the `nld` "best" model; Kraken 7.1.1 with torch 2.14
+(in `~/.venvs/kraken`), all on the CPU. The ImageMagick `magick` binary
 on this machine failed to start (missing `libraw_r.23.dylib`) and was not
 used.

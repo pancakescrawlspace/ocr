@@ -12,10 +12,18 @@ bin/ocr-pdf -l nld -C -m '=== page %d ===' ~/dev/orthodoxy/Psalterion.pdf
 #    out/Psalterion/Psalterion.clean.txt  same, with common OCR junk stripped
 ```
 
+For phone photos of pages (and scans without a text layer) there is a second
+entry point:
+
+```sh
+bin/ocr-photo photos/*.jpg
+# -> out/<name>/<name>.txt and <name>.clean.txt per photo
+```
+
 Everything is plain shell + Python 3 standard library on top of tools that
 MacPorts (or Homebrew/apt) provide. No virtualenv, no `sudo` for language data.
-The one exception is `prep-photo`, which needs numpy, Pillow and OpenCV
-(`pip install --user`).
+The exceptions are the photo tools: `prep-photo` needs numpy, Pillow and
+OpenCV (`pip install --user`), and `ocr-photo` needs Kraken.
 
 ## Contents
 
@@ -23,6 +31,7 @@ The one exception is `prep-photo`, which needs numpy, Pillow and OpenCV
 - [Quick start](#quick-start)
 - [The tools](#the-tools)
   - [`bin/ocr-pdf`](#binocr-pdf)
+  - [`bin/ocr-photo`](#binocr-photo)
   - [`bin/prep-photo`](#binprep-photo)
   - [`bin/clean-ocr`](#binclean-ocr)
   - [`bin/fetch-tessdata`](#binfetch-tessdata)
@@ -42,6 +51,7 @@ The one exception is `prep-photo`, which needs numpy, Pillow and OpenCV
 | `curl` | downloading language models | ships with macOS | — |
 | `magick` (ImageMagick 7), optional | `-P` image preprocessing | `port install ImageMagick` | `brew install imagemagick` |
 | `numpy`, `Pillow`, `opencv-python-headless` | `prep-photo` only | `python3 -m pip install --user numpy Pillow opencv-python-headless` | same |
+| Kraken (7.x) | `ocr-photo` only: line finding, optional recognition | `python3 -m venv ~/.venvs/kraken && ~/.venvs/kraken/bin/pip install kraken` | same |
 
 Both scripts run under the stock macOS `/bin/bash` 3.2 as well as newer bash.
 
@@ -118,6 +128,73 @@ Combine with `+` for documents that mix scripts, but note that every extra
 language slows OCR down and slightly raises the error rate for the primary
 one, so only add what is really on the page.
 
+### `bin/ocr-photo`
+
+OCR for phone photos of printed pages, and for page scans without a text
+layer. It combines three things:
+
+1. `bin/prep-photo` (below) cleans the photo: rotation, lighting, red ink,
+   pen marks, the surroundings of the page;
+2. Kraken's neural baseline segmenter finds the text lines on the cleaned
+   image, even where the page is blurred, curved or photographed at an angle.
+   Each baseline is lengthened a little at both ends and each line reaches a
+   little below its baseline, so that final commas and full stops, which
+   Kraken cuts off, are kept;
+3. Tesseract reads each line on its own (`--psm 7`), cut out of the image
+   with only the lighting flattened (the mark eraser sometimes eats into
+   letters on blurred photos), with white around it.
+
+Lines with almost no letters or a very low confidence (page edges, binder
+holes) are dropped, and the result goes through `clean-ocr -a`.
+
+```sh
+bin/ocr-photo photos/*.jpg                  # -> out/<name>/<name>.txt, .clean.txt
+bin/ocr-photo -d photo.jpg                  # also work/<name>/lines.png: the lines found
+bin/ocr-photo -l nld_lit photo.jpg          # with the fine-tuned Tesseract model (best)
+bin/ocr-photo -m models/liturgie-print.safetensors photo.jpg   # also read with a Kraken model
+bin/ocr-photo --out /tmp/try photo.jpg      # results elsewhere than out/<name>/
+# (the fine-tuned models are not in the repository; PHOTO-OCR.md, "Reproducing", trains them)
+```
+
+| Option | Meaning |
+|--------|---------|
+| `-l LANG` | Tesseract language [`nld`] |
+| `-b CHARS` | characters Tesseract may not output [`{}!\|`]; `!` because `//` is otherwise read as `!!` |
+| `-j N` | Tesseract processes in parallel [CPU count] |
+| `-m MODEL` | also read every line with this Kraken recognition model, and keep per line the reading with more words found in the lexicon |
+| `--lexicon FILE` | text whose words count as known [`out/Psalterion/Psalterion.clean.txt`] |
+| `-d` | also write `work/<name>/lines.png` (line polygons green, dropped lines red, baselines blue) |
+| `--no-prep` | skip prep-photo: segment and read the image as it is |
+| `--keep-accents` | `clean-ocr` without `-a` |
+| `--out DIR` | write `<DIR>/<name>.txt` and `.clean.txt` instead of `out/<name>/` |
+
+`work/<name>/lines.json` keeps, per line, the baseline, the polygon, both
+readings with their confidences, and which was kept.
+
+It needs Kraken; if `import kraken` fails, the script re-runs itself under
+`~/.venvs/kraken/bin/python` (or `$KRAKEN_PYTHON`). Kraken's segmentation
+takes a few seconds a page on the CPU, Tesseract about a second a line
+(in parallel).
+
+Character error rates on 14 phone photos and 8 scanned PDF pages, all with
+reader's pen marks (14,318 and 4,549 characters, `experiments/photo-ocr/evalset.py`):
+
+| Pipeline | Photos | Scans |
+|----------|--------|-------|
+| `tesseract --psm 4` on the EXIF-rotated image | 11.8% | 9.7% |
+| `prep-photo`, then `tesseract --psm 4`, `clean-ocr -a` | 6.5% | 2.7% |
+| `ocr-photo` | 2.65% | 1.47% |
+| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken, combined) | 2.30%* | 1.30% |
+| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.85%* | **0.86%** |
+
+\* measured with models trained on half of the photos, on the seven photos
+they did not see (`ocr-photo` scores 2.51% on those). The fine-tuned models
+are not in the repository (they are large); `experiments/photo-ocr/`
+rebuilds them, see PHOTO-OCR.md.
+
+How this came about, including every dead end, is in
+[PHOTO-OCR.md](PHOTO-OCR.md) and [SESSION-LOG.md](SESSION-LOG.md).
+
 ### `bin/prep-photo`
 
 Cleans up a phone photo of a printed page so that Tesseract can read it. A
@@ -156,8 +233,9 @@ TESSDATA_PREFIX=tessdata tesseract work/photo/prep.png - -l nld --psm 4 \
 | `-s SCALE` | upscale factor instead of the automatic one |
 | `-d` | also write `debug.png`: found line bands in green, erased marks and blobs in red, erased red ink in blue. Look at it when a result is off. |
 | `--keep-red`, `--keep-marks` | skip step 4 or step 5 |
+| `--flat FILE` | also write the image after steps 1–3 only (lighting flattened, page masked), at the same scale; `ocr-photo` reads lines from it |
 
-Measured on a photo of a page of Dutch liturgical text in a sleeve, with
+On its own, measured on the first photo of a page of Dutch liturgical text in a sleeve, with
 handwritten stress marks above and red underlines below many vowels
 (character error rate against a hand transcription, 1006 characters):
 
@@ -282,24 +360,33 @@ takes about a minute on a 16-core machine (Tesseract itself is ~1 s/page).
 ```
 bin/
   ocr-pdf            driver (bash)
+  ocr-photo          photos and scans: prep-photo + Kraken lines + Tesseract (Kraken's python)
   prep-photo         photo cleanup before OCR (python3 + numpy, Pillow, OpenCV)
   cer                character error rate against a transcription (python3, stdlib only)
   clean-ocr          artifact filter (python3, stdlib only)
   fetch-tessdata     language-model downloader (bash + curl)
 tessdata/            downloaded *.traineddata + pdf.ttf   (git-ignored)
-photos/              phone photos of pages                (*.jpg in Git LFS)
+photos/              phone photos of pages: only the first is in git (Git LFS);
+                     the others are git-ignored, to save LFS storage
+pdf/                 liturgie.pdf, scans of pages in the same style (git-ignored)
+models/              the fine-tuned Kraken model, made by training (git-ignored)
+experiments/photo-ocr/  scripts behind PHOTO-OCR.md: evaluation, training lines, synthetic
+                     lines, Tesseract and Kraken fine-tuning
 work/<basename>/     cache                                (git-ignored)
   img/page-NNNN.png  rendered pages (~2 MB each at 300 dpi; ~760 MB for 346 pages)
   ocr/page-NNNN.txt  per-page OCR text
   ocr/page-NNNN.log  per-page Tesseract messages
   ocr/page-NNNN.pdf  per-page searchable PDF (with -s)
   prep.png           prep-photo output for photo <basename>.jpg
+  flat.png           prep-photo --flat output (lighting flattened only)
   debug.png          prep-photo -d overlay
+  lines.json         ocr-photo: every line's baseline, polygon and readings
+  lines.png          ocr-photo -d overlay
 out/<basename>/      results
   <basename>.txt        raw OCR text
   <basename>.clean.txt  after clean-ocr (with -C)
   <basename>.pdf        searchable PDF (with -s)
-  <basename>.gt.txt     hand transcription, if made (for bin/cer)
+  <basename>.gt.txt     hand transcription, if made (for bin/cer and evalset.py)
 ```
 
 `work/` is safe to delete at any time; `out/` is small and worth keeping (or

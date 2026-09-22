@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+ocr-photo - OCR phone photos (or scans) of printed pages: prep-photo cleans the
+image, Kraken's neural baseline segmenter finds the text lines, and Tesseract
+reads each straightened line on its own.
+
+Why the combination: Tesseract's own page layout analysis wants straight,
+horizontal lines on a clean page and stumbles over blur, curvature, small
+print next to large print, and leftover pen marks; Kraken's segmenter finds
+every line even on a blurred or angled photo. Tesseract's Dutch model (with its
+dictionary) in turn reads this modern print better than any off-the-shelf
+Kraken recognition model. On 14 test photos this cuts the error rate of
+prep-photo + tesseract --psm 4 from 6.5% to 2.65% CER, on 8 scanned pages from
+2.7% to 1.5%; see PHOTO-OCR.md.
+
+Per image:
+  1. bin/prep-photo           -> work/<name>/prep.png (lighting flattened, red
+     ink, pen marks and page surroundings removed) and work/<name>/flat.png
+     (lighting flattened and page masked only)
+  2. Kraken blla segmentation of prep.png, every baseline lengthened at both
+     ends (blla stops at the last letter, cutting off a final , or .) and
+     every line polygon extended under the baseline (the polygons clip comma
+     tails)
+  3. each line cut out of flat.png (the removal of marks and red ink finds the
+     lines better but, on blurred photos, also eats into letters), straightened,
+     everything outside the line made white (Kraken fills it black, which ruins
+     Tesseract's threshold on faint lines), read by tesseract --psm 7
+  4. lines with almost no letters, or with a very low confidence (page edges,
+     binder holes), dropped
+  5. with -m MODEL, a Kraken recognition model reads the same lines as well
+     (from prep.png, as it was trained), and per line the reading with more
+     words known to the lexicon wins; ties, and Kraken readings with a mean
+     character confidence below 80, go to Tesseract
+  6. out/<name>/<name>.txt, and <name>.clean.txt through clean-ocr -a
+work/<name>/lines.json keeps every line's baseline, polygon, text and
+Tesseract confidence; with -d, work/<name>/lines.png shows the polygons.
+
+Usage: ocr-photo [options] IMAGE...
+  -l LANG       Tesseract language                               [nld]
+  -b CHARS      characters Tesseract may not output              [{}!|]
+                ('' allows everything; '!' is excluded because the
+                half-verse mark // is otherwise read as !!)
+  -j N          Tesseract processes in parallel                  [CPU count]
+  -m MODEL      also read with this Kraken model and keep the better reading
+                per line (a fine-tuned model: see PHOTO-OCR.md)
+  --lexicon FILE  text whose words count as known, for -m
+                [out/Psalterion/Psalterion.clean.txt]
+  -d            also write work/<name>/lines.png
+  --no-prep     segment and read the image as it is
+  --keep-accents  run clean-ocr without -a
+  --out DIR     write <DIR>/<name>.txt and .clean.txt instead of out/<name>/
+                (for trying settings or models without touching out/)
+
+Needs Kraken (it re-runs itself under ~/.venvs/kraken/bin/python, or
+$KRAKEN_PYTHON, when `import kraken` fails), Tesseract, and for prep-photo
+numpy, Pillow and OpenCV in the default python3.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import numpy as np
+    from PIL import Image, ImageDraw
+    from scipy.ndimage import binary_dilation
+    import shapely.geometry as geom
+    from dataclasses import replace
+    from kraken import blla
+    from kraken.lib.segmentation import calculate_polygonal_environment, extract_polygons
+    from kraken.configs import RecognitionInferenceConfig
+    from kraken.tasks import RecognitionTaskModel
+except ImportError:
+    py = os.environ.get('KRAKEN_PYTHON', os.path.expanduser('~/.venvs/kraken/bin/python'))
+    # a venv's python is a symlink to the same binary, so only an environment flag tells the two runs apart
+    if not os.environ.get('OCR_PHOTO_REEXEC') and os.path.exists(py):
+        os.environ['OCR_PHOTO_REEXEC'] = '1'
+        os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
+    sys.exit('ocr-photo: Kraken is not importable; install it (pip install kraken) or set KRAKEN_PYTHON')
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXTEND = 0.4     # baseline lengthening at each end, in median line heights
+BELOW = 0.35     # strip added under the baseline, in the line's own mean height
+
+
+def segment(im):
+    """blla segmentation with lengthened baselines and polygons that reach under the baseline."""
+    seg = blla.segment(im)
+    hs = [np.ptp(np.array(l.boundary)[:, 1]) for l in seg.lines if l.boundary]
+    e = EXTEND * float(np.median(hs)) if hs else 0.0
+    W, H = im.size
+
+    def extend(bl):
+        p = np.array(bl, float)
+        d0, d1 = p[0] - p[1], p[-1] - p[-2]
+        p[0] += e * d0 / (np.hypot(*d0) or 1)
+        p[-1] += e * d1 / (np.hypot(*d1) or 1)
+        p[:, 0] = p[:, 0].clip(8, W - 9)          # the polygonizer fails at the image border
+        p[:, 1] = p[:, 1].clip(8, H - 9)
+        return p.astype(int).tolist()
+
+    bls = [extend(l.baseline) for l in seg.lines]
+    polys = calculate_polygonal_environment(im, bls)
+    lines = []
+    for l, b, p in zip(seg.lines, bls, polys):
+        if p is None:                               # no polygon for the lengthened line: keep blla's own
+            b, p = l.baseline, l.boundary
+        else:
+            poly, base = geom.Polygon(p).buffer(0), geom.LineString(b)
+            d = BELOW * poly.area / max(base.length, 1)
+            strip = geom.Polygon([*b, *[[x, min(H - 1, y + d)] for x, y in b[::-1]]]).buffer(0)
+            u = poly.union(strip)
+            if u.geom_type == 'Polygon':
+                p = [[int(x), int(y)] for x, y in u.exterior.coords]
+        lines.append(replace(l, baseline=b, boundary=p))
+    return replace(seg, lines=lines)
+
+
+def line_images(im, seg, white=True):
+    """Straightened line images with white (or, white=False, Kraken's black) outside the line polygon."""
+    if not white:
+        return [lim.convert('L') for lim, _ in extract_polygons(im, seg)]
+    blank = Image.new('L', im.size, 255)
+    out = []
+    for (lim, _), (mim, _) in zip(extract_polygons(im, seg), extract_polygons(blank, seg)):
+        lim = lim.convert('L')
+        mask = binary_dilation(np.asarray(mim.convert('L').resize(lim.size, Image.NEAREST)) < 250, iterations=2)
+        out.append(Image.fromarray(np.where(mask, 255, np.asarray(lim)).astype(np.uint8)))
+    return out
+
+
+def read_line(path, lang, blacklist):
+    cmd = ['tesseract', path, '-', '-l', lang, '--psm', '7', '-c', 'tessedit_create_tsv=1']
+    if blacklist:
+        cmd += ['-c', f'tessedit_char_blacklist={blacklist}']
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    words = [w.split('\t') for w in r.stdout.splitlines()[1:] if w.count('\t') >= 11]
+    words = [(w[11], float(w[10])) for w in words if w[11].strip() and float(w[10]) >= 0]
+    conf = sum(c for _, c in words) / len(words) if words else 0.0
+    return ' '.join(t for t, _ in words), conf
+
+
+def words(text):
+    """Lower-case words, stress accents dropped (as clean-ocr -a does), the diaeresis kept."""
+    t = unicodedata.normalize('NFD', text.lower())
+    t = ''.join(c for c in t if not unicodedata.combining(c) or c == '\u0308')
+    return re.findall(r"[^\W\d_]+|'", unicodedata.normalize('NFC', t))
+
+
+def lexicon_score(text, lexicon):
+    w = words(text)
+    return sum(x in lexicon for x in w) - 0.5 * sum(x not in lexicon for x in w)
+
+
+def kraken_read(net, im, seg):
+    """(text, mean character confidence 0-100) per line; on the CPU, as the default device hung here."""
+    cfg = RecognitionInferenceConfig(accelerator='cpu', device=1, num_line_workers=0, num_threads=4)
+    out = []
+    for rec in net.predict(im, seg, cfg):
+        c = rec.confidences
+        out.append((rec.prediction.strip(), 100 * sum(c) / len(c) if c else 0.0))
+    return out
+
+
+def is_junk(text, conf):
+    """Page edges, binder holes and shadows read as text: almost no letters, or a very low confidence.
+    (A fine-tuned model reads a page edge as a long string of letters, at confidence 23-33; no real
+    line was ever below 48 with it, or below 30 with the stock model.)"""
+    letters = sum(c.isalpha() for c in text)
+    return letters < 3 or (conf < 55 and letters < 8) or conf < 30
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('images', nargs='*')
+    ap.add_argument('-l', default='nld')
+    ap.add_argument('-b', default='{}!|')
+    ap.add_argument('-j', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('-d', action='store_true')
+    ap.add_argument('-m')
+    ap.add_argument('--lexicon', default=os.path.join(ROOT, 'out', 'Psalterion', 'Psalterion.clean.txt'))
+    ap.add_argument('--no-prep', action='store_true')
+    ap.add_argument('--keep-accents', action='store_true')
+    ap.add_argument('--out')
+    ap.add_argument('-h', '--help', action='store_true')
+    a = ap.parse_args()
+    if a.help or not a.images:
+        print(__doc__.strip())
+        return 0 if a.help else 2
+    os.environ.setdefault('TESSDATA_PREFIX', os.environ.get('TESSDATA_DIR', os.path.join(ROOT, 'tessdata')))
+    if not os.path.exists(os.path.join(os.environ['TESSDATA_PREFIX'], a.l.split('+')[0] + '.traineddata')):
+        subprocess.run([os.path.join(ROOT, 'bin', 'fetch-tessdata'), '-d', os.environ['TESSDATA_PREFIX'], a.l], check=True)
+
+    net = lexicon = None
+    if a.m:
+        net = RecognitionTaskModel.load_model(a.m)
+        lexicon = set()
+        for line in open(a.lexicon, encoding='utf-8'):
+            lexicon.update(words(line))
+
+    for path in a.images:
+        name = os.path.splitext(os.path.basename(path))[0]
+        work, out = os.path.join(ROOT, 'work', name), a.out or os.path.join(ROOT, 'out', name)
+        os.makedirs(work, exist_ok=True)
+        os.makedirs(out, exist_ok=True)
+        if a.no_prep:
+            src = flat = path
+        else:
+            src, flat = os.path.join(work, 'prep.png'), os.path.join(work, 'flat.png')
+            subprocess.run([os.path.join(ROOT, 'bin', 'prep-photo'), '-o', src, '--flat', flat, path], check=True)
+        im = Image.open(src).convert('L')
+        seg = segment(im)
+        with tempfile.TemporaryDirectory() as td:
+            paths = []
+            for k, lim in enumerate(line_images(Image.open(flat).convert('L'), seg)):
+                paths.append(os.path.join(td, f'{k:03d}.png'))
+                lim.save(paths[-1])
+            with ThreadPoolExecutor(a.j) as ex:
+                results = list(ex.map(lambda p: read_line(p, a.l, a.b), paths))
+        records = [dict(baseline=l.baseline, boundary=l.boundary, text=t, conf=round(c, 1), junk=is_junk(t, c))
+                   for l, (t, c) in zip(seg.lines, results)]
+        for r in records:
+            r['tesseract'] = r['text']
+        if net:
+            for r, (kt, kc) in zip(records, kraken_read(net, im, seg)):
+                r['kraken'], r['kraken_conf'] = kt, round(kc, 1)
+                if kc >= 80 and lexicon_score(kt, lexicon) > lexicon_score(r['text'], lexicon):
+                    r['text'] = kt
+        json.dump(dict(image=src, read_from=flat, lines=records), open(os.path.join(work, 'lines.json'), 'w'), ensure_ascii=False, indent=1)
+        text = '\n'.join(r['text'] for r in records if not r['junk']) + '\n'
+        raw = os.path.join(out, name + '.txt')
+        open(raw, 'w', encoding='utf-8').write(text)
+        clean_cmd = [os.path.join(ROOT, 'bin', 'clean-ocr')] + ([] if a.keep_accents else ['-a']) + [raw]
+        with open(os.path.join(out, name + '.clean.txt'), 'w', encoding='utf-8') as f:
+            subprocess.run(clean_cmd, stdout=f, check=True)
+        if a.d:
+            vis = im.convert('RGB')
+            d = ImageDraw.Draw(vis)
+            for r in records:
+                d.line([tuple(p) for p in r['boundary']] + [tuple(r['boundary'][0])], fill=(200, 0, 0) if r['junk'] else (0, 140, 0), width=3)
+                d.line([tuple(p) for p in r['baseline']], fill=(0, 0, 255), width=3)
+            vis.save(os.path.join(work, 'lines.png'))
+        kept = sum(not r['junk'] for r in records)
+        by_kraken = sum(not r['junk'] and r['text'] != r['tesseract'] for r in records)
+        print(f'{path} -> {raw}  ({kept} lines' + (f', {by_kraken} from Kraken' if net else '') +
+              f', {len(records) - kept} dropped as junk)', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
