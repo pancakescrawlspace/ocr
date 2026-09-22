@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""
+cer - character error rate of OCR output against a hand transcription.
+
+Both texts are normalised first: Unicode NFC, runs of whitespace collapsed
+to one space, blank lines dropped (line breaks themselves count). The error
+rate is the Levenshtein distance (insertions, deletions, substitutions)
+divided by the length of the transcription.
+
+Meant for a page or a few pages at a time: the distance is computed in pure
+Python, O(n*m), about a second for two 1000-character texts.
+
+Usage: cer TRANSCRIPTION OCR.txt...
+       cer -d TRANSCRIPTION OCR.txt     # also show the differing lines
+"""
+
+import difflib
+import re
+import sys
+import unicodedata
+
+
+def normalise(text):
+    text = unicodedata.normalize("NFC", text)
+    lines = (re.sub(r"\s+", " ", l).strip() for l in text.splitlines())
+    return "\n".join(l for l in lines if l)
+
+
+def distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def main(argv):
+    show_diff = "-d" in argv
+    args = [a for a in argv if a != "-d"]
+    if "-h" in args or "--help" in args or len(args) < 2:
+        print(__doc__.strip())
+        return 0 if args and args[0] in ("-h", "--help") else 2
+    with open(args[0], encoding="utf-8") as f:
+        truth = normalise(f.read())
+    width = max(len(p) for p in args[1:])
+    for path in args[1:]:
+        with open(path, encoding="utf-8") as f:
+            text = normalise(f.read())
+        d = distance(truth, text)
+        print(f"{path:{width}s}  CER {100 * d / len(truth):5.2f}%  ({d} edits / {len(truth)} chars)")
+        if show_diff:
+            sys.stdout.writelines(difflib.unified_diff(
+                [l + "\n" for l in truth.splitlines()], [l + "\n" for l in text.splitlines()],
+                "transcription", path, n=0))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

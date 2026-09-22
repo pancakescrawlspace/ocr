@@ -1,6 +1,7 @@
 # ocr
 
-A small, reusable toolchain for turning scanned PDFs into plain text with
+A small, reusable toolchain for turning scanned PDFs (and phone photos of
+pages) into plain text with
 [Tesseract](https://github.com/tesseract-ocr/tesseract). It was built to OCR
 `Psalterion.pdf` (the 1970/1983 Dutch Orthodox psalter, 346 scanned pages) and
 is written so that the next document is a one-liner.
@@ -13,6 +14,8 @@ bin/ocr-pdf -l nld -C -m '=== page %d ===' ~/dev/orthodoxy/Psalterion.pdf
 
 Everything is plain shell + Python 3 standard library on top of tools that
 MacPorts (or Homebrew/apt) provide. No virtualenv, no `sudo` for language data.
+The one exception is `prep-photo`, which needs numpy, Pillow and OpenCV
+(`pip install --user`).
 
 ## Contents
 
@@ -20,6 +23,7 @@ MacPorts (or Homebrew/apt) provide. No virtualenv, no `sudo` for language data.
 - [Quick start](#quick-start)
 - [The tools](#the-tools)
   - [`bin/ocr-pdf`](#binocr-pdf)
+  - [`bin/prep-photo`](#binprep-photo)
   - [`bin/clean-ocr`](#binclean-ocr)
   - [`bin/fetch-tessdata`](#binfetch-tessdata)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -37,6 +41,7 @@ MacPorts (or Homebrew/apt) provide. No virtualenv, no `sudo` for language data.
 | `python3` | `clean-ocr` (stdlib only) | ships with Xcode CLT | — |
 | `curl` | downloading language models | ships with macOS | — |
 | `magick` (ImageMagick 7), optional | `-P` image preprocessing | `port install ImageMagick` | `brew install imagemagick` |
+| `numpy`, `Pillow`, `opencv-python-headless` | `prep-photo` only | `python3 -m pip install --user numpy Pillow opencv-python-headless` | same |
 
 Both scripts run under the stock macOS `/bin/bash` 3.2 as well as newer bash.
 
@@ -113,6 +118,83 @@ Combine with `+` for documents that mix scripts, but note that every extra
 language slows OCR down and slightly raises the error rate for the primary
 one, so only add what is really on the page.
 
+### `bin/prep-photo`
+
+Cleans up a phone photo of a printed page so that Tesseract can read it. A
+photo differs from a scan in ways Tesseract does not handle by itself: the
+camera stores the picture sideways with an EXIF "rotate" tag that Tesseract
+ignores (it recognises *nothing* in such a file), the light is uneven and a
+plastic sleeve adds a grey haze, the binder or table around the page turns
+into junk lines, and readers' pen marks come out as letters or accents. The
+script, per photo:
+
+1. applies the EXIF orientation;
+2. divides each colour channel by an estimate of the bare paper, which makes
+   the page evenly white and white-balances it;
+3. blanks everything outside the page (the largest bright region);
+4. removes red ink: after white balancing, black ink absorbs red and green
+   light alike, red ink far less red than green;
+5. removes pen marks above the lines: it finds the x-height band of every
+   text line from the ink density and erases small, elongated blobs that
+   float just above a band without touching it (i/j dots and the dots of ë
+   are compact and stay). Blobs nowhere near a line (page edges, binder
+   rings, specks) go too;
+6. upscales so that letters are about 58 px tall.
+
+All sizes are relative to the measured letter height. Output is a greyscale
+PNG; Tesseract binarises it itself.
+
+```sh
+bin/prep-photo -d photo.jpg              # -> work/photo/prep.png, work/photo/debug.png
+TESSDATA_PREFIX=tessdata tesseract work/photo/prep.png - -l nld --psm 4 \
+    -c 'tessedit_char_blacklist={}!|' | bin/clean-ocr -a > photo.txt
+```
+
+| Option | Meaning |
+|--------|---------|
+| `-o FILE` | output file (only with a single photo) |
+| `-s SCALE` | upscale factor instead of the automatic one |
+| `-d` | also write `debug.png`: found line bands in green, erased marks and blobs in red, erased red ink in blue. Look at it when a result is off. |
+| `--keep-red`, `--keep-marks` | skip step 4 or step 5 |
+
+Measured on a photo of a page of Dutch liturgical text in a sleeve, with
+handwritten stress marks above and red underlines below many vowels
+(character error rate against a hand transcription, 1006 characters):
+
+| Pipeline | CER |
+|----------|-----|
+| the photo as is | nothing recognised (sideways) |
+| EXIF-rotated only | 5.1% |
+| `prep-photo` | 2.3% |
+| … + `tessedit_char_blacklist={}!\|` | 1.9% |
+| … + `clean-ocr -a` | 1.3% |
+
+What was learnt on the way:
+
+- Flattening the light alone did not help this photo: as long as nothing is
+  burnt out to pure white, Tesseract's own binarisation copes with uneven
+  light. The pen marks were what cost characters. Tesseract merges a row of
+  marks with the line above it (`vergeving.` became `ie col`) or reads them
+  as accents.
+- Marks that touch a letter cannot be separated from it (they are as dark
+  and nearly as thick as the print) and come out as accents: `Hèer`,
+  `zònden`. `clean-ocr -a` strips those again.
+- `--psm 4` (one column, mixed sizes); `--psm 6` was three times worse here.
+- The blacklist stops the half-verse marker `//` from being read as `!!` or
+  `{!`; it still becomes `Il` now and then. Leave the blacklist out for texts
+  that contain real `!`.
+- Burnt-out glare cannot be recovered afterwards: retake the photo with the
+  light at an angle, or take the page out of the sleeve.
+- There is no perspective correction: the slight keystone of a hand-held
+  photo is well within what Tesseract tolerates. For strongly angled shots,
+  use the phone's document-scan mode first.
+
+`bin/cer TRANSCRIPTION OCR.txt…` scores OCR output against a hand
+transcription (character error rate; `-d` also shows the differing lines).
+It is how the numbers above were measured. The full account of how the
+pipeline came about, with every experiment and its result, is in
+[PHOTO-OCR.md](PHOTO-OCR.md).
+
 ### `bin/clean-ocr`
 
 A filter that strips the most common Tesseract artifacts from a text file.
@@ -128,11 +210,17 @@ pattern that does not occur in ordinary running text:
 3. strip a trailing ` |` or ` _`;
 4. re-attach a stranded `*` line to the end of the previous line (half-verse
    markers in psalters and hymnals, footnote markers elsewhere);
-5. strip trailing whitespace and collapse runs of blank lines to one.
+5. strip trailing whitespace and collapse runs of blank lines to one;
+6. only with `-a`: strip grave, acute, circumflex and tilde accents, keeping
+   the diaeresis (`ë`, `ï`). Meant for pages with handwritten stress or
+   chant marks, which Tesseract reads as accents (`Hèer`, `zònden`). `één`
+   and `vóór` are left alone; other genuinely accented words (`café`) lose
+   their accent, which is why this rule is opt-in.
 
 ```sh
 bin/clean-ocr out/Doc/Doc.txt > out/Doc/Doc.clean.txt   # clean
 bin/clean-ocr -s out/Doc/Doc.txt | less                  # preview as a diff
+bin/clean-ocr -a photo.txt                               # also strip stress-mark accents
 ```
 
 `ocr-pdf -C` runs it for you. The raw `<basename>.txt` is always kept, so
@@ -194,18 +282,24 @@ takes about a minute on a 16-core machine (Tesseract itself is ~1 s/page).
 ```
 bin/
   ocr-pdf            driver (bash)
+  prep-photo         photo cleanup before OCR (python3 + numpy, Pillow, OpenCV)
+  cer                character error rate against a transcription (python3, stdlib only)
   clean-ocr          artifact filter (python3, stdlib only)
   fetch-tessdata     language-model downloader (bash + curl)
 tessdata/            downloaded *.traineddata + pdf.ttf   (git-ignored)
+photos/              phone photos of pages                (*.jpg in Git LFS)
 work/<basename>/     cache                                (git-ignored)
   img/page-NNNN.png  rendered pages (~2 MB each at 300 dpi; ~760 MB for 346 pages)
   ocr/page-NNNN.txt  per-page OCR text
   ocr/page-NNNN.log  per-page Tesseract messages
   ocr/page-NNNN.pdf  per-page searchable PDF (with -s)
+  prep.png           prep-photo output for photo <basename>.jpg
+  debug.png          prep-photo -d overlay
 out/<basename>/      results
   <basename>.txt        raw OCR text
   <basename>.clean.txt  after clean-ocr (with -C)
   <basename>.pdf        searchable PDF (with -s)
+  <basename>.gt.txt     hand transcription, if made (for bin/cer)
 ```
 
 `work/` is safe to delete at any time; `out/` is small and worth keeping (or

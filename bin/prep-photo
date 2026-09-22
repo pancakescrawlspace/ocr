@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+prep-photo - turn a phone photo of a printed page into a clean image for OCR.
+
+A photo is not a scan: the page is lit unevenly, a plastic sleeve adds a grey
+haze, the camera stores the picture sideways with an EXIF "rotate" tag that
+Tesseract ignores, and whatever lies around the page (binder, table, rings)
+becomes junk text. Readers' pen marks on the page are read as letters or
+accents. This script fixes what can be fixed in the image:
+
+  1. apply the EXIF orientation;
+  2. flatten the lighting: every colour channel is divided by an estimate of
+     the bare paper, which makes the page evenly white and white-balances it;
+  3. blank everything outside the page (the largest bright region);
+  4. remove red ink: black ink absorbs red and green light alike, red ink
+     absorbs far less red than green -- underlines in red pen disappear;
+  5. remove pen marks above the lines (stress/chant marks, corrections): the
+     x-height band of every text line is found from ink density, and small
+     elongated blobs that float just above a band without touching it are
+     erased; compact dots (i, j, ë) are kept. Blobs nowhere near a line
+     (page edges, binder rings, specks) are erased too;
+  6. upscale so that letters are about 58 px tall (Tesseract reads better).
+
+All sizes are relative to the measured letter height, so the resolution of
+the photo does not matter much. Marks that touch a letter cannot be told
+apart from it and stay; Tesseract reads them as accents, which
+`clean-ocr -a` strips again.
+
+Output is a greyscale PNG (Tesseract binarises it itself), by default
+work/<basename>/prep.png; with -d also debug.png, the page with the found
+line bands in green, erased marks in red and erased red ink in blue.
+
+Usage: prep-photo [options] IMAGE...
+  -o FILE      output file (only with a single IMAGE)
+  -s SCALE     upscale factor instead of the automatic one
+  -d           also write the debug overlay
+  --keep-red   do not remove red ink
+  --keep-marks do not remove pen marks and stray blobs
+Then, e.g.:
+  TESSDATA_PREFIX=tessdata tesseract work/X/prep.png - -l nld --psm 4 | bin/clean-ocr -a
+"""
+
+import argparse
+import os
+import sys
+
+try:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageOps
+except ImportError as e:
+    sys.exit(f"prep-photo: {e}; install with: python3 -m pip install --user numpy Pillow opencv-python-headless")
+
+LUMA = np.array([0.299, 0.587, 0.114], np.float32)
+TARGET_HEIGHT = 58          # median letter height (px) to upscale to
+
+
+def odd(x):
+    return max(1, int(round(x)) // 2 * 2 + 1)
+
+
+def paper(ch, f):
+    """Estimate of the bare paper under a channel: the brightest ~7f px around each point."""
+    h, w = ch.shape
+    k = np.ones((7, 7), np.uint8)
+    s = cv2.resize(ch, (w // f, h // f), interpolation=cv2.INTER_AREA)
+    s = cv2.dilate(s, k)
+    s = cv2.dilate(cv2.erode(s, k), k)                       # drop isolated bright specks
+    return cv2.resize(cv2.GaussianBlur(s, (0, 0), 3), (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def prepare(path, keep_red=False, keep_marks=False, scale=None):
+    rgb = np.asarray(ImageOps.exif_transpose(Image.open(path)).convert("RGB"), np.float32) / 255
+    H, W = rgb.shape[:2]
+    f = max(2, round(max(H, W) / 400))
+
+    # 2. flat field, per channel
+    flat = np.clip(rgb / np.maximum(np.dstack([paper(rgb[..., c], f) for c in range(3)]), 1e-3), 0, 1)
+    gray = flat @ LUMA
+
+    # 3. the page: largest region whose paper is at least 55% as bright as the brightest paper
+    bg = paper(rgb @ LUMA, f)
+    bright = (bg > 0.55 * np.percentile(bg, 95)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bright, connectivity=4)
+    page = lab == 1 + np.argmax(st[1:, 4])
+
+    # 4. red ink, on smoothed absorbance (black ink: red/green ratio ~0.92, red pen ~0.75)
+    A = cv2.GaussianBlur(1 - flat, (0, 0), 1.5)
+    ratio = A[..., 0] / np.maximum(A[..., 1], 1e-3)
+    red = np.zeros((H, W), bool)
+    if not keep_red:
+        cand = ((A[..., 1] > 0.12) & (ratio < 0.84)).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+        red = (st[:, 4] >= 15)[lab] & (lab > 0)
+        red = (cv2.dilate(red.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0) & (ratio < 0.9)
+
+    # ink: a little lighter than Otsu, so that faint pen strokes are found as well
+    g8 = (np.where(red, 1.0, gray) * 255).astype(np.uint8)
+    otsu, _ = cv2.threshold(g8[page], 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    T = otsu + 0.3 * (255 - otsu)
+    ink = ((g8 < T) & page).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    x, y, w, h, area = st.T
+    hs = h[1:][(area[1:] >= 30) & (h[1:] <= H // 20)]
+    u = float(np.median(hs)) if hs.size else 40.0          # the letter-height unit
+
+    # 5. line bands and marks
+    remove = np.zeros(n, bool)
+    core = np.zeros((H, W), bool)
+    if not keep_marks:
+        speck = area < u * u / 120
+        big = np.maximum(w, h) > 3 * u
+        textlike = ~speck & ~big
+        textlike[0] = False
+        # x-height band: rows at least half as dense as the densest row within one unit up/down
+        dens = cv2.boxFilter(textlike[lab].astype(np.float32), -1, (odd(7.7 * u), odd(u / 8)))
+        lmax = cv2.dilate(dens, np.ones((odd(2 * u), 1), np.uint8))
+        core = ((dens >= 0.5 * lmax) & (dens >= 0.06)).astype(np.uint8)
+        core = cv2.dilate(core, np.ones((odd(0.2 * u), 1), np.uint8)) > 0    # reach baseline punctuation
+        below, far = int(1.15 * u), int(1.5 * u)
+        remove[1:] = speck[1:]
+        for i in range(1, n):
+            if remove[i]:
+                continue
+            xi, yi, wi, hi, ai = st[i]
+            if not core[max(0, yi - far):yi + hi + far, xi:xi + wi].any():
+                remove[i] = True                            # nowhere near a line: edges, rings, dirt
+                continue
+            if big[i]:
+                continue
+            mine = lab[yi:yi + hi, xi:xi + wi] == i
+            if core[yi:yi + hi, xi:xi + wi][mine].any():
+                continue                                    # part of a text line
+            if max(wi, hi) <= 1.8 * min(wi, hi) and ai >= 0.5 * wi * hi:
+                continue                                    # a dot: i, j, ë
+            if core[yi + hi:yi + hi + below, xi:xi + wi].any():
+                remove[i] = True                            # floats just above a line: a mark
+
+    gone = cv2.dilate(remove[lab].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    clean = np.where(gone | ~page | (g8 >= T), 255, g8).astype(np.uint8)
+
+    # 6. upscale
+    s = scale or max(1.0, round(TARGET_HEIGHT / u * 4) / 4)
+    if s != 1:
+        clean = cv2.resize(clean, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+    debug = np.dstack([(gray * 255).astype(np.uint8)] * 3)
+    light = core & ~ink.astype(bool)
+    debug[light] = (debug[light] * 0.85 + np.array([0, 38, 0])).astype(np.uint8)
+    debug[~page] //= 3
+    debug[red & (A[..., 1] > 0.12)] = (0, 120, 255)
+    debug[remove[lab] & (lab > 0)] = (255, 0, 0)
+    stats = dict(unit=u, scale=s, marks=int(remove.sum()), red=int((red & page).sum()))
+    return clean, debug, stats
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("images", nargs="*")
+    ap.add_argument("-o")
+    ap.add_argument("-s", type=float)
+    ap.add_argument("-d", action="store_true")
+    ap.add_argument("--keep-red", action="store_true")
+    ap.add_argument("--keep-marks", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help or not a.images:
+        print(__doc__.strip())
+        return 0 if a.help else 2
+    if a.o and len(a.images) > 1:
+        print("prep-photo: -o needs a single IMAGE", file=sys.stderr)
+        return 2
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for path in a.images:
+        base = os.path.splitext(os.path.basename(path))[0]
+        out = a.o or os.path.join(root, "work", base, "prep.png")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        clean, debug, st = prepare(path, a.keep_red, a.keep_marks, a.s)
+        Image.fromarray(clean).save(out)
+        if a.d:
+            Image.fromarray(debug).save(os.path.join(os.path.dirname(os.path.abspath(out)), "debug.png"))
+        print(f"{path} -> {out}  (letter height {st['unit']:.0f} px, x{st['scale']:g}, "
+              f"{st['marks']} marks/blobs erased, {st['red']} red px)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

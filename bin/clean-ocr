@@ -20,26 +20,44 @@ does not occur in ordinary running text:
   3. strip a trailing " |" or " _" (the right-hand page edge);
   4. re-attach a stranded "*" line to the end of the previous line (half-verse
      markers in psalters and hymnals, footnote markers elsewhere);
-  5. strip trailing whitespace and collapse runs of blank lines to one.
+  5. strip trailing whitespace and collapse runs of blank lines to one;
+  6. only with -a: strip grave, acute, circumflex and tilde accents, keeping
+     the diaeresis (ë, ï). For pages with handwritten stress or chant marks,
+     which Tesseract reads as accents ("Hèer", "zònden"). The few Dutch
+     words whose accent matters (één, vóór) are left alone; other genuinely
+     accented words (café) lose their accent, so this rule is opt-in.
 
 Page markers written by ocr-pdf -m (e.g. "=== page 12 ===") contain digits and
 are therefore never dropped by rule 1; choose a marker that contains a letter
 or digit if you use a custom one.
 
-Usage: clean-ocr [FILE] > cleaned.txt
-       clean-ocr -s [FILE]      # only print what would change, as a diff
+Usage: clean-ocr [-a] [FILE] > cleaned.txt
+       clean-ocr -s [-a] [FILE]   # only print what would change, as a diff
 """
 
 import difflib
 import re
 import sys
+import unicodedata
 
 LEAD_JUNK = re.compile(r"^[_‚|'‘.,;:!]+\s+(?=\S)")
 TRAIL_JUNK = re.compile(r"\s+[|_‚]+$")
 ALNUM = re.compile(r"[^\W_]", re.UNICODE)   # any letter or digit
+WORD = re.compile(r"\w+", re.UNICODE)
+STRESS = dict.fromkeys(map(ord, "\u0300\u0301\u0302\u0303"))   # grave, acute, circumflex, tilde
+KEEP_ACCENTED = {"één", "vóór"}
 
 
-def clean(lines):
+def strip_accents(line):
+    def fix(m):
+        w = m.group(0)
+        if w.lower() in KEEP_ACCENTED:
+            return w
+        return unicodedata.normalize("NFC", unicodedata.normalize("NFD", w).translate(STRESS))
+    return WORD.sub(fix, unicodedata.normalize("NFC", line))
+
+
+def clean(lines, accents=False):
     out = []
     blank_pending = False
     for raw in lines:
@@ -57,6 +75,8 @@ def clean(lines):
 
         line = LEAD_JUNK.sub("", line)                          # rule 2
         line = TRAIL_JUNK.sub("", line)                         # rule 3
+        if accents:
+            line = strip_accents(line)                          # rule 6
 
         if not line:                                            # rule 5
             blank_pending = bool(out)
@@ -70,10 +90,13 @@ def clean(lines):
 
 def main(argv):
     show_diff = False
+    accents = False
     args = []
     for a in argv:
         if a == "-s":
             show_diff = True
+        elif a == "-a":
+            accents = True
         elif a in ("-h", "--help"):
             print(__doc__.strip())
             return 0
@@ -86,7 +109,7 @@ def main(argv):
     src = open(args[0], encoding="utf-8") if args else sys.stdin
     with src:
         original = src.read().splitlines()
-    cleaned = clean(original)
+    cleaned = clean(original, accents)
 
     if show_diff:
         sys.stdout.writelines(difflib.unified_diff(
