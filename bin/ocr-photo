@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-ocr-photo - OCR phone photos (or scans) of printed pages: prep-photo cleans the
-image, Kraken's neural baseline segmenter finds the text lines, and Tesseract
-reads each straightened line on its own.
+ocr-photo - OCR photos (tablet, phone, camera) or scans of printed pages:
+prep-photo cleans the image, Kraken's neural baseline segmenter finds the text
+lines, and Tesseract reads each straightened line on its own.
 
 Why the combination: Tesseract's own page layout analysis wants straight,
 horizontal lines on a clean page and stumbles over blur, curvature, small
 print next to large print, and leftover pen marks; Kraken's segmenter finds
 every line even on a blurred or angled photo. Tesseract's Dutch model (with its
 dictionary) in turn reads this modern print better than any off-the-shelf
-Kraken recognition model. On 14 test photos this cuts the error rate of
-prep-photo + tesseract --psm 4 from 6.5% to 2.65% CER, on 8 scanned pages from
-2.7% to 1.5%; see PHOTO-OCR.md.
+Kraken recognition model. On 15 test photos this cuts the error rate of
+prep-photo + tesseract --psm 4 from 6.6% to 2.5% CER, on 8 scanned pages from
+2.9% to 1.5%; with Tesseract fine-tuned on these pages (-l nld_lit), the scans
+go to 0.9%. See PHOTO-OCR.md and TESSERACT-FINETUNING.md.
 
 Per image:
   1. bin/prep-photo           -> work/<name>/prep.png (lighting flattened, red

@@ -1,6 +1,6 @@
-# Session log: OCR of phone photos
+# Session log: OCR of tablet photos
 
-A chronological record of one working session (2026-09-22) on OCR of phone
+A chronological record of one working session (2026-09-22) on OCR of tablet
 photos of printed pages: what was tried, what went wrong, why, and what fixed
 it, with the commands to reconstruct each step. The dead ends are in here on
 purpose. The finished method is described in [PHOTO-OCR.md](PHOTO-OCR.md).
@@ -19,12 +19,13 @@ project).
 - [Part 3: training Kraken](#part-3-training-kraken)
 - [Part 4: a scanned PDF as an independent test](#part-4-a-scanned-pdf-as-an-independent-test)
 - [Part 5: fine-tuning Tesseract](#part-5-fine-tuning-tesseract)
+- [Part 6: a fifteenth photo, and a bug in prep-photo](#part-6-a-fifteenth-photo-and-a-bug-in-prep-photo)
 - [Where it ended](#where-it-ended)
 - [Lessons](#lessons)
 
 ## Part 1: one photo, Tesseract
 
-**The question.** A phone photo of a printed page in a plastic sleeve
+**The question.** A tablet photo of a printed page in a plastic sleeve
 (`photos/20251128_143633.jpg`): how do you prepare it for OCR? First the
 photo was measured (orientation, clipping, brightness, ink colours), then a
 hand transcription was made (`out/20251128_143633/20251128_143633.gt.txt`) to
@@ -403,17 +404,66 @@ experiments/photo-ocr/train_tesseract.sh nld_lit
 bin/ocr-photo -l nld_lit --out /tmp/t work/liturgie/*.jpg && experiments/photo-ocr/evalset.py '/tmp/t/{}.clean.txt'
 ```
 
+## Part 6: a fifteenth photo, and a bug in prep-photo
+
+A later photo (`photos/20260707_215411.jpg`, July 2026: a feast troparion,
+close up, bluish, soft, one line cut off by the frame) was run through every
+pipeline and model, after transcribing it (`out/20260707_215411/…gt.txt`;
+the word cut off by the frame is transcribed as printed, `zij`, as the user
+confirmed):
+
+```sh
+bin/ocr-photo -d photos/20260707_215411.jpg
+bin/ocr-photo -l nld_lit --out /tmp/t photos/20260707_215411.jpg
+bin/ocr-photo -m models/liturgie-print.safetensors --out /tmp/m photos/20260707_215411.jpg
+~/.venvs/kraken/bin/python experiments/photo-ocr/kraken_read.py models/liturgie-print.safetensors /tmp/k 20260707_215411
+bin/cer out/20260707_215411/20260707_215411.gt.txt out/20260707_215411/*.clean.txt /tmp/t/*.clean.txt …
+```
+
+**Issue 32: a heading disappeared, and so, earlier, had a word.** Every
+pipeline lost most of the heading "Feesttropaar toon 7". The line overlay
+(`work/<name>/lines.png`) showed a line only around `toon 7`, and
+prep-photo's own overlay (`bin/prep-photo -d`) showed "Feesttropaar" in red:
+erased. On this soft photo its blurred letters had run together into one
+blob, about ten letter heights wide. prep-photo called any blob wider *or*
+taller than 3 letter heights "big" (meant for page edges and rings), left big
+blobs out when finding text lines, and erased them when no line was near. So
+the word did not help find its own line, and then was erased for lying away
+from a line. *Fix:* "big" means taller than 2 letter heights; a merged word
+is wide but low.
+
+The same bug explains the word "vertrouwe" lost on the blurred photo 143749
+in issue 18, which had been put down to the red-ink removal: it had merged
+and been erased, and Kraken split the line at the gap. Results with the fix:
+the new photo 4.7% → 3.0%, 143749 7.3% → 3.6%, all 15 photos 2.75% → 2.46%,
+part 1's pipeline on the first photo 1.29% → 0.70%; the scans 1.47% → 1.49%,
+and a few characters worse on some sharp photos (wide, low blobs now shift
+Kraken's line outlines slightly).
+
+Because prep-photo feeds every pipeline, everything was measured again; the
+tables in PHOTO-OCR.md, README.md and "Where it ended" are the new numbers.
+
+**Issue 33: two lines seemed missing from training.** tesstrain's lists had
+4,779 + 531 = 5,310 lines for 5,312 lines of data. They were all there: its
+split script writes the lists without a final newline, and `wc -l` counts
+newlines.
+
 ## Where it ended
 
-| Pipeline | Photos (14) | Scans (8) |
-|----------|-------------|-----------|
-| `tesseract --psm 4`, EXIF-rotated | 11.84% | 9.69% |
-| part 1: `prep-photo` + `tesseract --psm 4` | 6.54% | 2.68% |
-| `ocr-photo` (Kraken's lines, stock Tesseract) | 2.65% | 1.47% |
-| `ocr-photo -m` (plus fine-tuned Kraken) | 2.30%* | 1.30% |
-| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.85%* | **0.86%** |
+With the fix of part 6:
 
-\* on the seven photos the half-A models did not see.
+| Pipeline | Photos (15) | Scans (8) |
+|----------|-------------|-----------|
+| `tesseract --psm 4`, EXIF-rotated | 11.85% | 9.69% |
+| part 1: `prep-photo` + `tesseract --psm 4` | 6.57% | 2.86% |
+| `ocr-photo` (Kraken's lines, stock Tesseract) | 2.46% | 1.49% |
+| `ocr-photo -m` (plus fine-tuned Kraken) | 2.30%* | 1.32% |
+| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.89%* | **0.86%** |
+
+\* on the seven photos the half-A models did not see (stock: 2.59%).
+
+The fine-tuning of Tesseract, the best option, is written up in full in
+[TESSERACT-FINETUNING.md](TESSERACT-FINETUNING.md).
 
 Kraken's contribution that lasted is its **segmentation**; its recognition,
 even fine-tuned, is beaten by a fine-tuned Tesseract. The committed outputs

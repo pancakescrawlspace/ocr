@@ -1,7 +1,7 @@
-# OCR from phone photos
+# OCR from tablet photos
 
 How `bin/prep-photo`, `clean-ocr -a` and `bin/ocr-photo` came about. Part 1
-starts from one phone photo of a printed page that Tesseract could not read
+starts from one tablet photo of a printed page that Tesseract could not read
 as-is: the techniques that were on the table, what the photo really needed,
 every experiment with its measured result, and the pipeline that came out of
 it. Part 2 takes that pipeline to thirteen more photos and eight scanned
@@ -31,6 +31,7 @@ Part 2: fourteen photos, eight scans, and Kraken
 - [Fine-tuning Tesseract](#fine-tuning-tesseract)
 - [The ocr-photo pipeline](#the-ocr-photo-pipeline)
 - [Results](#results)
+- [A fifteenth photo, and a fix to prep-photo](#a-fifteenth-photo-and-a-fix-to-prep-photo)
 
 Both parts
 - [Limitations](#limitations)
@@ -39,7 +40,7 @@ Both parts
 
 ## The photo
 
-`photos/20251128_143633.jpg` (in Git LFS): a phone photo, 3264×2448 pixels, of a
+`photos/20251128_143633.jpg` (in Git LFS): a tablet photo, 3264×2448 pixels, of a
 printed page in a punched plastic sleeve in a ring binder, a red cover behind it.
 The page is Dutch liturgical text in a sans-serif typeface: psalm verses in
 small print (`L: [10] Voer mijn ziel uit de kerker, …`), stichera in large
@@ -69,7 +70,7 @@ most involved.
   the per-pixel *minimum*. Glare only ever adds light, so this cancels it;
 - use cross-polarisation (polariser film on the lamp, a second one on the
   lens at 90°), which removes reflections from plastic entirely;
-- use a phone document-scan mode (Notes/Files "Scan Documents", Microsoft
+- use a tablet or phone document-scan mode (Notes/Files "Scan Documents", Microsoft
   Lens, Adobe Scan), which does edge detection, perspective and shading
   correction in one go.
 
@@ -316,13 +317,14 @@ at least 30 px (38 px here).
 5. **Ink:** Otsu on the page, threshold `T = Otsu + 0.3 × (255 − Otsu)`;
    8-connected components.
 6. **Line bands:** the density of text-like ink (no specks under u²/120 px,
-   nothing larger than 3u) in a 7.7u × u/8 window. A band is where that
+   nothing taller than 2u; until part 2's fix: nothing wider or taller than
+   3u) in a 7.7u × u/8 window. A band is where that
    density is ≥ 0.5 × the maximum within ±u vertically and ≥ 0.06; it is
    extended ±0.1u vertically.
 7. **Erase:**
    - specks;
    - blobs with no band within 1.5u above or below them;
-   - blobs that are not larger than 3u, do not touch a band, are not a dot
+   - blobs no taller than 2u (until the fix: no larger than 3u) that do not touch a band, are not a dot
      (aspect ≤ 1.8, filled ≥ 50%), and have a band within 1.15u below.
 
    Erased pixels, plus a 1 px ring, become white, as does anything lighter
@@ -354,7 +356,7 @@ CER 1.29% on the first photo (that output has since been replaced by
 
 ## The material
 
-- **14 phone photos** (`photos/`), all from the same binder, taken within
+- **14 tablet photos** (`photos/`), all from the same binder, taken within
   three minutes with a Samsung SM-T220 tablet: two blurred by camera shake
   (143653, 143749), one strongly angled with small print, several with the
   binder's punched holes or a dark hand shadow in the picture, and all with
@@ -516,6 +518,9 @@ the same list, but a cleaner list should do better.
 
 ## Fine-tuning Tesseract
 
+(The full description, with every parameter, the commands and the pitfalls,
+is in [TESSERACT-FINETUNING.md](TESSERACT-FINETUNING.md).)
+
 Tesseract's model is a container that can be unpacked (`combine_tessdata
 -u`): the neural network (3.3 MB, spec
 `[1,36,0,1Ct3,3,16Mp3,3Lfys64Lfx96Lrx96Lfx192O1c1]`, itself trained in 2017
@@ -591,24 +596,85 @@ About 15 seconds a page on this Mac (10 cores in use), a few more with `-m`.
 
 ## Results
 
-| Pipeline | Photos (14) | Scans (8) |
-|----------|-------------|-----------|
-| `tesseract --psm 4`, EXIF-rotated image | 11.84% | 9.69% |
-| part 1: `prep-photo` + `tesseract --psm 4` + `clean-ocr -a` | 6.54% | 2.68% |
-| `ocr-photo` | 2.65% | 1.47% |
-| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken) | 2.30%* | 1.30% |
-| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.85%* | **0.86%** |
+With the current code (including the fix of the next section), on all 15
+photos (15,015 characters) and the 8 scans:
 
-\* The production models are trained on all fourteen photos, so on the photos
-only the half-A models can be measured, on the seven photos they did not see
-(`ocr-photo` scores 2.51% on those seven).
+| Pipeline | Photos (15) | Scans (8) |
+|----------|-------------|-----------|
+| `tesseract --psm 4`, EXIF-rotated image | 11.85% | 9.69% |
+| part 1: `prep-photo` + `tesseract --psm 4` + `clean-ocr -a` | 6.57% | 2.86% |
+| `ocr-photo` | 2.46% | 1.49% |
+| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken) | 2.30%* | 1.32% |
+| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.89%* | **0.86%** |
+| `ocr-photo -l nld_lit -m …` (both) | | 0.88% |
+
+\* The production models are trained on fourteen of the photos, so on the
+photos only the half-A models can be measured, on the seven photos they did
+not see (`ocr-photo` scores 2.59% on those seven). On the fifteenth photo,
+which no model saw: `ocr-photo` 3.01%, `-l nld_lit` 2.87%, `-m` 2.73%.
 
 The photos' remaining errors are concentrated on the two blurred ones
-(143653: 8.2%, 143749: 7.3%, most of it in small print); the other twelve
-are at 1.54% together. The typical remaining errors are
+(143653: 8.0%, 143749: 3.6%, most of it in small print); the other thirteen
+are at 1.75% together. The typical remaining errors are
 punctuation (`L:` read as `L.`, a final `,` as `.`), capitals after a stress
 mark (`Opgestaan`), `//` read as `Il`, and single letters in blurred small
 print.
+
+## A fifteenth photo, and a fix to prep-photo
+
+`photos/20260707_215411.jpg` was taken months after the others: a different
+page (a feast troparion and kondakion), close up, a bluish cast, soft focus,
+one line cut off by the frame, and a handwritten correction after the last
+printed word. No model had seen it. Every pipeline lost most of its first
+line, the italic heading "Feesttropaar toon 7": only `r toon 7` came out.
+
+**The cause.** prep-photo's mark eraser (step 7 of part 1's pipeline) does
+not see letters but *blobs*: groups of dark pixels that touch. It sorts them
+into three kinds:
+
+1. **specks**, tiny: erased;
+2. **"big" blobs**, meant for page edges, binder rings and shadows: they are
+   left out when finding where the text lines are, and erased when no text
+   line lies within 1.5 letter heights above or below them;
+3. **the rest**, letters and pen marks: where these are dense is a text
+   line, and small elongated blobs just above a line (stress marks) are
+   erased.
+
+A blob counted as "big" if it was more than **3 letter heights wide or
+tall**. On a sharp photo every letter is its own blob. On a blurred one,
+neighbouring letters bleed into each other and a whole word becomes one blob:
+"Feesttropaar" was a single blob about ten letter heights wide but only one
+line tall. By its width it was "big", so it did not count towards its own
+line (a line was found only for "toon 7"), and being "big" with no line in
+reach, it was erased. Kraken finds lines on the cleaned image, so it never
+saw a line there; Tesseract reads from the image in which the word was
+intact, but only inside the lines Kraken found.
+
+**The fix.** "Big" is now decided by **height only**: more than 2 letter
+heights. Page edges, rings and holes are tall and still count as big; a
+merged word is wide but one line high, and now counts as text.
+
+**The same bug, earlier and unnoticed.** On the blurred photo 143749 the
+word "vertrouwe" had merged into one blob and been erased; Kraken saw a gap
+and split the line in two (`[4] Van de ochtendwaks tot de nacht va` and
+`we israël op de Heer`). That was put down to the red-ink removal at the
+time (reading from `flat.png` recovered part of it); the real cause was this.
+With the fix the line reads `… tot de nacht vertrouwe \sraël op de Heer`.
+
+| | before | after |
+|-|--------|-------|
+| the fifteenth photo, `ocr-photo` | 4.73% | 3.01% |
+| 143749 (blurred, angled), `ocr-photo` | 7.3% | 3.6% |
+| all 15 photos, `ocr-photo` | 2.75% | **2.46%** |
+| the 8 scans, `ocr-photo` | 1.47% | 1.49% |
+| the first photo, part 1's pipeline | 1.29% | 0.70% |
+
+On some sharp photos a few characters got worse (`Gij` read as `Jij`, a `//`
+lost, `L:` as `L`): wide, low blobs such as an underline or a row of merged
+marks now count as text and move Kraken's line outline slightly. Tesseract
+still reads the same pixels; only where the line is cut changes. The
+fine-tuned models were trained before the fix, on lines cut with the old
+prep-photo; their test scores in "Results" are measured with the fix.
 
 ## Limitations
 
@@ -616,9 +682,9 @@ print.
   binder, in Arial with the same kind of marks. Other typefaces need their
   own synthetic lines (`synth.py` takes any font) and, for the Kraken model,
   their own transcribed lines.
-- **Blurred photos stay hard.** The two shaken photos are at 7–8% even now,
-  most of it in small print; no preprocessing recovers detail that is not in
-  the picture. Retake them.
+- **Blurred photos stay hard.** The worst shaken photo (143653) is at 8%
+  even now, most of it in small print; no preprocessing recovers detail that
+  is not in the picture. Retake it.
 - **Touching marks** stay in the image and come out as accents or capitals
   (`Opgestaan`). `clean-ocr -a` strips the accents but also genuine ones
   (`café`), which is why it is opt-in.

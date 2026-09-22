@@ -3,7 +3,7 @@
 evalset.py - score OCR output for every page that has a hand transcription.
 
 A transcription is out/<name>/<name>.gt.txt. The pages fall into two groups:
-the phone photos (20251128_*) and the scanned PDF pages (liturgie-p*), which
+the tablet photos (2025*/2026*) and the scanned PDF pages (liturgie-p*), which
 are scored and totalled separately.
 
 Usage: experiments/photo-ocr/evalset.py [PATTERN...]

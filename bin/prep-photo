@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-prep-photo - turn a phone photo of a printed page into a clean image for OCR.
+prep-photo - turn a photo of a printed page (tablet, phone, camera) into a
+clean image for OCR.
 
 A photo is not a scan: the page is lit unevenly, a plastic sleeve adds a grey
 haze, the camera stores the picture sideways with an EXIF "rotate" tag that
@@ -18,7 +19,9 @@ accents. This script fixes what can be fixed in the image:
      x-height band of every text line is found from ink density, and small
      elongated blobs that float just above a band without touching it are
      erased; compact dots (i, j, ë) are kept. Blobs nowhere near a line
-     (page edges, binder rings, specks) are erased too;
+     (page edges, binder rings, specks) are erased too. Only a blob taller
+     than two letter heights counts as "not text": on blurred photos whole
+     words run together into one wide, low blob, which must stay;
   6. upscale so that letters are about 58 px tall (Tesseract reads better).
 
 All sizes are relative to the measured letter height, so the resolution of
@@ -111,7 +114,7 @@ def prepare(path, keep_red=False, keep_marks=False, scale=None):
     core = np.zeros((H, W), bool)
     if not keep_marks:
         speck = area < u * u / 120
-        big = np.maximum(w, h) > 3 * u
+        big = h > 2 * u          # taller than a line: page edges, rings; blurred words merge into wide, low blobs
         textlike = ~speck & ~big
         textlike[0] = False
         # x-height band: rows at least half as dense as the densest row within one unit up/down

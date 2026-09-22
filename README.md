@@ -1,6 +1,6 @@
 # ocr
 
-A small, reusable toolchain for turning scanned PDFs (and phone photos of
+A small, reusable toolchain for turning scanned PDFs (and photos of
 pages) into plain text with
 [Tesseract](https://github.com/tesseract-ocr/tesseract). It was built to OCR
 `Psalterion.pdf` (the 1970/1983 Dutch Orthodox psalter, 346 scanned pages) and
@@ -12,8 +12,8 @@ bin/ocr-pdf -l nld -C -m '=== page %d ===' ~/dev/orthodoxy/Psalterion.pdf
 #    out/Psalterion/Psalterion.clean.txt  same, with common OCR junk stripped
 ```
 
-For phone photos of pages (and scans without a text layer) there is a second
-entry point:
+For photos of pages, taken with a tablet, phone or camera (and scans without
+a text layer), there is a second entry point:
 
 ```sh
 bin/ocr-photo photos/*.jpg
@@ -130,8 +130,8 @@ one, so only add what is really on the page.
 
 ### `bin/ocr-photo`
 
-OCR for phone photos of printed pages, and for page scans without a text
-layer. It combines three things:
+OCR for photos of printed pages (tablet, phone, camera), and for page scans
+without a text layer. It combines three things:
 
 1. `bin/prep-photo` (below) cleans the photo: rotation, lighting, red ink,
    pen marks, the surroundings of the page;
@@ -176,29 +176,32 @@ It needs Kraken; if `import kraken` fails, the script re-runs itself under
 takes a few seconds a page on the CPU, Tesseract about a second a line
 (in parallel).
 
-Character error rates on 14 phone photos and 8 scanned PDF pages, all with
-reader's pen marks (14,318 and 4,549 characters, `experiments/photo-ocr/evalset.py`):
+Character error rates on 15 tablet photos and 8 scanned PDF pages, all with
+reader's pen marks (15,015 and 4,549 characters, `experiments/photo-ocr/evalset.py`):
 
 | Pipeline | Photos | Scans |
 |----------|--------|-------|
-| `tesseract --psm 4` on the EXIF-rotated image | 11.8% | 9.7% |
-| `prep-photo`, then `tesseract --psm 4`, `clean-ocr -a` | 6.5% | 2.7% |
-| `ocr-photo` | 2.65% | 1.47% |
-| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken, combined) | 2.30%* | 1.30% |
-| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.85%* | **0.86%** |
+| `tesseract --psm 4` on the EXIF-rotated image | 11.9% | 9.7% |
+| `prep-photo`, then `tesseract --psm 4`, `clean-ocr -a` | 6.6% | 2.9% |
+| `ocr-photo` | 2.46% | 1.49% |
+| `ocr-photo -m models/liturgie-print.safetensors` (fine-tuned Kraken, combined) | 2.30%* | 1.32% |
+| `ocr-photo -l nld_lit` (fine-tuned Tesseract) | 1.89%* | **0.86%** |
 
 \* measured with models trained on half of the photos, on the seven photos
-they did not see (`ocr-photo` scores 2.51% on those). The fine-tuned models
+they did not see (`ocr-photo` scores 2.59% on those). The fine-tuned models
 are not in the repository (they are large); `experiments/photo-ocr/`
-rebuilds them, see PHOTO-OCR.md.
+rebuilds them.
 
-How this came about, including every dead end, is in
+The fine-tuned Tesseract model is the best option found; how it is made, with
+every parameter and pitfall, is in [TESSERACT-FINETUNING.md](TESSERACT-FINETUNING.md).
+How all of this came about, including every dead end, is in
 [PHOTO-OCR.md](PHOTO-OCR.md) and [SESSION-LOG.md](SESSION-LOG.md).
 
 ### `bin/prep-photo`
 
-Cleans up a phone photo of a printed page so that Tesseract can read it. A
-photo differs from a scan in ways Tesseract does not handle by itself: the
+Cleans up a photo of a printed page (tablet, phone, camera) so that
+Tesseract can read it. A photo differs from a scan in ways Tesseract does not
+handle by itself: the
 camera stores the picture sideways with an EXIF "rotate" tag that Tesseract
 ignores (it recognises *nothing* in such a file), the light is uneven and a
 plastic sleeve adds a grey haze, the binder or table around the page turns
@@ -215,7 +218,9 @@ script, per photo:
    text line from the ink density and erases small, elongated blobs that
    float just above a band without touching it (i/j dots and the dots of ë
    are compact and stay). Blobs nowhere near a line (page edges, binder
-   rings, specks) go too;
+   rings, specks) go too. A blob taller than two letter heights is not
+   text; a wide but low one is (on blurred photos whole words run together
+   into one blob, which must not be taken for a page edge);
 6. upscales so that letters are about 58 px tall.
 
 All sizes are relative to the measured letter height. Output is a greyscale
@@ -265,7 +270,7 @@ What was learnt on the way:
   light at an angle, or take the page out of the sleeve.
 - There is no perspective correction: the slight keystone of a hand-held
   photo is well within what Tesseract tolerates. For strongly angled shots,
-  use the phone's document-scan mode first.
+  use the tablet's or phone's document-scan mode first.
 
 `bin/cer TRANSCRIPTION OCR.txt…` scores OCR output against a hand
 transcription (character error rate; `-d` also shows the differing lines).
@@ -366,7 +371,7 @@ bin/
   clean-ocr          artifact filter (python3, stdlib only)
   fetch-tessdata     language-model downloader (bash + curl)
 tessdata/            downloaded *.traineddata + pdf.ttf   (git-ignored)
-photos/              phone photos of pages: only the first is in git (Git LFS);
+photos/              tablet photos of pages: only the first is in git (Git LFS);
                      the others are git-ignored, to save LFS storage
 pdf/                 liturgie.pdf, scans of pages in the same style (git-ignored)
 models/              the fine-tuned Kraken model, made by training (git-ignored)
