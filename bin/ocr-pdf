@@ -4,8 +4,11 @@
 #
 # Pipeline: pdftoppm renders each page to a greyscale PNG, Tesseract OCRs the
 # pages in parallel, and the per-page results are concatenated into one text
-# file. Every intermediate is cached under the work directory, so re-running
-# after a crash, or with a wider page range, only does the missing work.
+# file. Blank lines between paragraphs (stanzas) are placed by hocr-text from
+# the line positions Tesseract reports, not by Tesseract's paragraph finder,
+# which is unreliable on verse. Every intermediate is cached under the work
+# directory, so re-running after a crash, or with a wider page range, only
+# does the missing work.
 #
 # Usage: ocr-pdf [options] FILE.pdf
 #
@@ -31,6 +34,8 @@
 #   -c KEY=VAL  extra Tesseract config variable (repeatable)
 #   -s          also produce a searchable PDF (image + invisible text layer)
 #   -C          also write <basename>.clean.txt, run through clean-ocr
+#   -T          keep Tesseract's own blank lines instead of placing them
+#               by line spacing (hocr-text)
 #   -F          force: discard cached renders and OCR results first
 #   -h          this help
 #
@@ -38,8 +43,9 @@
 #   TESSDATA_DIR  where language models live            [<repo>/tessdata]
 #
 # Output: <outdir>/<basename>.txt, plus <basename>.clean.txt with -C and
-# <basename>.pdf with -s. Per-page text lives in <workdir>/ocr/page-NNNN.txt
-# next to the rendered images in <workdir>/img/, handy for proofreading.
+# <basename>.pdf with -s. Per-page text lives in <workdir>/text/page-NNNN.txt
+# (Tesseract's own in <workdir>/ocr/, next to the hOCR), the rendered images
+# in <workdir>/img/, handy for proofreading.
 
 set -euo pipefail
 
@@ -64,9 +70,10 @@ jpeg_quality=""
 configs=""
 make_pdf=0
 make_clean=0
+tess_layout=0
 force=0
 
-while getopts ":l:r:p:f:t:j:o:w:m:P:q:c:sCFh" opt; do
+while getopts ":l:r:p:f:t:j:o:w:m:P:q:c:sCTFh" opt; do
   case "$opt" in
     l) ocr_lang="$OPTARG" ;;
     r) dpi="$OPTARG" ;;
@@ -82,6 +89,7 @@ while getopts ":l:r:p:f:t:j:o:w:m:P:q:c:sCFh" opt; do
     c) configs="$configs -c $OPTARG" ;;
     s) make_pdf=1 ;;
     C) make_clean=1 ;;
+    T) tess_layout=1 ;;
     F) force=1 ;;
     h) usage 0 ;;
     :) echo "error: -$OPTARG requires an argument" >&2; usage 2 ;;
@@ -169,17 +177,18 @@ ocr_page() {
   local n="$1" id extra=""
   id="$(printf 'page-%04d' "$n")"
   if [ "$MAKE_PDF" -eq 1 ]; then
-    [ -f "$OCRDIR/$id.txt" ] && [ -f "$OCRDIR/$id.pdf" ] && return 0
+    [ -f "$OCRDIR/$id.txt" ] && [ -f "$OCRDIR/$id.hocr" ] && [ -f "$OCRDIR/$id.pdf" ] && return 0
     extra="-c tessedit_create_pdf=1"
   else
-    [ -f "$OCRDIR/$id.txt" ] && return 0
+    [ -f "$OCRDIR/$id.txt" ] && [ -f "$OCRDIR/$id.hocr" ] && return 0
   fi
   # Write under a temporary name and rename on success, so that an existing
   # page-NNNN.txt always means "finished" (blank pages give empty files).
   # shellcheck disable=SC2086
   tesseract "$IMGDIR/$id.$IMGEXT" "$OCRDIR/$id.tmp" -l "$OCR_LANG" --psm "$PSM" \
-      -c tessedit_create_txt=1 $extra $CONFIGS >"$OCRDIR/$id.log" 2>&1 \
+      -c tessedit_create_txt=1 -c tessedit_create_hocr=1 $extra $CONFIGS >"$OCRDIR/$id.log" 2>&1 \
     || { rm -f "$OCRDIR/$id.tmp".*; echo "ocr failed: page $n (see $OCRDIR/$id.log)" >&2; return 1; }
+  mv "$OCRDIR/$id.tmp.hocr" "$OCRDIR/$id.hocr"
   mv "$OCRDIR/$id.tmp.txt" "$OCRDIR/$id.txt"
   [ "$MAKE_PDF" -eq 1 ] && mv "$OCRDIR/$id.tmp.pdf" "$OCRDIR/$id.pdf"
   return 0
@@ -194,11 +203,23 @@ todo="$(page_list | while read -r n; do [ -s "$imgdir/$(printf 'page-%04d' "$n")
 log "rendering $todo page(s) -> $imgdir"
 page_list | xargs -P "$jobs" -n 1 bash -c 'render_page "$@"' _ || die "rendering failed"
 
-todo="$(page_list | while read -r n; do id="$ocrdir/$(printf 'page-%04d' "$n")"; [ -f "$id.txt" ] && { [ "$make_pdf" -eq 0 ] || [ -f "$id.pdf" ]; } || echo "$n"; done | wc -l | tr -d ' ')"
+todo="$(page_list | while read -r n; do id="$ocrdir/$(printf 'page-%04d' "$n")"; [ -f "$id.txt" ] && [ -f "$id.hocr" ] && { [ "$make_pdf" -eq 0 ] || [ -f "$id.pdf" ]; } || echo "$n"; done | wc -l | tr -d ' ')"
 log "OCR of $todo page(s) -> $ocrdir"
 page_list | xargs -P "$jobs" -n 1 bash -c 'ocr_page "$@"' _ || die "OCR failed"
 
 # --- assemble --------------------------------------------------------------
+
+# Page text with blank lines placed by line spacing. Cheap, so always redone:
+# all pages go through one hocr-text run, which also lets pages with too few
+# lines borrow the line pitch of the others.
+if [ "$tess_layout" -eq 1 ]; then
+  textdir="$ocrdir"
+else
+  textdir="$workdir/text"
+  rm -rf "$textdir"
+  page_list | while read -r n; do printf '%s/page-%04d.hocr\n' "$ocrdir" "$n"; done \
+    | tr '\n' '\0' | xargs -0 "$script_dir/hocr-text" -o "$textdir" || die "hocr-text failed"
+fi
 
 txt="$outdir/$name.txt"
 log "writing $txt"
@@ -213,7 +234,7 @@ log "writing $txt"
       printf '%s' "$sep"; sep=$'\f'
     fi
     # Tesseract ends each page with a form feed; strip that and trailing blanks.
-    tr -d '\f' < "$ocrdir/$id.txt" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+    tr -d '\f' < "$textdir/$id.txt" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
   done
 } > "$txt"
 

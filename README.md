@@ -33,6 +33,7 @@ OpenCV (`pip install --user`), and `ocr-photo` needs Kraken.
   - [`bin/ocr-pdf`](#binocr-pdf)
   - [`bin/ocr-photo`](#binocr-photo)
   - [`bin/prep-photo`](#binprep-photo)
+  - [`bin/hocr-text`](#binhocr-text)
   - [`bin/clean-ocr`](#binclean-ocr)
   - [`bin/fetch-tessdata`](#binfetch-tessdata)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -113,6 +114,8 @@ Usage: ocr-pdf [options] FILE.pdf
   -c KEY=VAL  extra Tesseract config variable (repeatable)
   -s          also produce a searchable PDF (image + invisible text layer)
   -C          also write <basename>.clean.txt, run through clean-ocr
+  -T          keep Tesseract's own blank lines instead of placing them
+              by line spacing (hocr-text)
   -F          force: discard cached renders and OCR results first
   -h          this help
 
@@ -278,6 +281,41 @@ It is how the numbers above were measured. The full account of how the
 pipeline came about, with every experiment and its result, is in
 [PHOTO-OCR.md](PHOTO-OCR.md).
 
+### `bin/hocr-text`
+
+Rebuilds a page's text from Tesseract's hOCR output, deciding where the
+blank lines go from the line positions instead of from Tesseract's
+paragraph detection. `ocr-pdf` runs it on every page unless you pass `-T`.
+
+Tesseract's plain-text output puts a blank line between "paragraphs", but
+its paragraph finder is unreliable on verse: in the Psalterion it put a
+blank line inside 542 verses (between the `*` half and the rest) and left
+out dozens of stanza breaks. The page geometry, on the other hand, is
+unambiguous: consecutive lines of a verse have their baselines ~80 px apart
+at 300 dpi, and a new stanza starts ~120 px down.
+
+For each pair of consecutive lines it measures the distance between the
+baselines, taken at a common x so a slightly rotated page does not skew it.
+Where Tesseract's baseline fit is clearly off (a slope unlike the rest of
+the page, or a baseline outside its own box, which descenders and specks of
+dust sometimes cause), it takes the median of the top-edge, baseline and
+bottom-edge distances instead. The page's normal line pitch is the 30th
+percentile of these distances, and every distance above 1.25 × pitch gets a
+blank line. So does a jump back up the page (a new column). Pages with too
+few lines, or whose lines Tesseract broke into fragments (a badly degraded
+scan), use the median pitch of the whole document. Words and line breaks
+are exactly Tesseract's; only the blank lines change.
+
+```sh
+bin/hocr-text work/Doc/ocr/page-0040.hocr               # one page to stdout
+bin/hocr-text -o /tmp/text work/Doc/ocr/page-*.hocr     # all pages, one .txt each
+bin/hocr-text -d work/Doc/ocr/page-0040.hocr            # show each gap and the verdict
+bin/hocr-text -g 1.4 ...                                # break only on larger gaps
+```
+
+`-d` is the tool to reach for when a blank line is wrong: it prints the
+page's pitch and every line with its distance to the previous one.
+
 ### `bin/clean-ocr`
 
 A filter that strips the most common Tesseract artifacts from a text file.
@@ -340,15 +378,20 @@ text layer of searchable PDFs) into the same directory.
    are simply upsampled. With `-P`, the rendered image is piped through
    ImageMagick before it is stored.
 3. **OCR** — `tesseract page-NNNN.png page-NNNN -l LANG --psm PSM` per page,
-   again `-j` in parallel. Tesseract's stderr goes to `page-NNNN.log`.
-   Outputs are written under a temporary name and renamed on success, so an
-   existing `page-NNNN.txt` always means "finished" (blank pages produce
-   empty files, which is correct).
-4. **Assemble** — the per-page texts are concatenated in order into
+   again `-j` in parallel, writing both plain text and hOCR (the same text
+   with the position of every line and word). Tesseract's stderr goes to
+   `page-NNNN.log`. Outputs are written under a temporary name and renamed
+   on success, so an existing `page-NNNN.txt` always means "finished"
+   (blank pages produce empty files, which is correct).
+4. **Blank lines** — one `hocr-text` run over all pages' hOCR writes
+   `text/page-NNNN.txt`, with blank lines placed by line spacing (see
+   [`hocr-text`](#binhocr-text)). This is cheap and redone every time;
+   `-T` skips it and uses Tesseract's own `page-NNNN.txt`.
+5. **Assemble** — the per-page texts are concatenated in order into
    `out/<basename>/<basename>.txt`. Tesseract's trailing form feed and
    blank lines are trimmed from each page; pages are then separated by
    `\f` (pdftotext convention) or, with `-m`, by a visible marker line.
-5. **Optional extras** — `-s` asks Tesseract for a per-page PDF as well and
+6. **Optional extras** — `-s` asks Tesseract for a per-page PDF as well and
    `pdfunite` joins them; `-C` runs `clean-ocr`.
 
 Steps 2 and 3 are cached. Each cache directory carries a `.stamp` with the
@@ -368,6 +411,7 @@ bin/
   ocr-photo          photos and scans: prep-photo + Kraken lines + Tesseract (Kraken's python)
   prep-photo         photo cleanup before OCR (python3 + numpy, Pillow, OpenCV)
   cer                character error rate against a transcription (python3, stdlib only)
+  hocr-text          hOCR -> text, blank lines placed by line spacing (python3, stdlib only)
   clean-ocr          artifact filter (python3, stdlib only)
   fetch-tessdata     language-model downloader (bash + curl)
 tessdata/            downloaded *.traineddata + pdf.ttf   (git-ignored)
@@ -379,7 +423,9 @@ experiments/photo-ocr/  scripts behind PHOTO-OCR.md: evaluation, training lines,
                      lines, Tesseract and Kraken fine-tuning
 work/<basename>/     cache                                (git-ignored)
   img/page-NNNN.png  rendered pages (~2 MB each at 300 dpi; ~760 MB for 346 pages)
-  ocr/page-NNNN.txt  per-page OCR text
+  ocr/page-NNNN.txt  per-page OCR text, as Tesseract laid it out
+  ocr/page-NNNN.hocr per-page OCR text with line and word positions
+  text/page-NNNN.txt per-page text with blank lines placed by hocr-text
   ocr/page-NNNN.log  per-page Tesseract messages
   ocr/page-NNNN.pdf  per-page searchable PDF (with -s)
   prep.png           prep-photo output for photo <basename>.jpg
@@ -462,7 +508,7 @@ check `TESSDATA_DIR`.
 OCR is never perfect; on a good scan expect a few wrong characters per
 page and the occasional stray mark from dust. The cache is laid out for
 side-by-side checking: `work/<basename>/img/page-0040.png` is exactly what
-Tesseract saw when it wrote `work/<basename>/ocr/page-0040.txt`, and `-m`
+Tesseract saw when it wrote `work/<basename>/text/page-0040.txt`, and `-m`
 markers give you the page number in the assembled file.
 
 Handy checks:
@@ -500,8 +546,18 @@ Command used (defaults everywhere else: 300 dpi, PSM 3, no preprocessing,
 bin/ocr-pdf -l nld -C -m '=== page %d ===' ~/dev/orthodoxy/Psalterion.pdf
 ```
 
-Result: `out/Psalterion/Psalterion.txt` (raw, 11 990 lines / 51 553 words)
-and `out/Psalterion/Psalterion.clean.txt`. Wall time 58 s with 16 jobs.
+Result: `out/Psalterion/Psalterion.txt` (raw, 11 315 lines / 51 581 words)
+and `out/Psalterion/Psalterion.clean.txt`. Wall time 30 s with 16 jobs
+(Tesseract 5.5.3; the first run, with 5.4.1, took 58 s and differed in
+~650 words, nearly all of them margin noise).
+
+Blank lines, counted in the cleaned text: with Tesseract's own layout (now
+`-T`), 542 verses had a blank line right after their `*` half, and 57 times
+a new verse (a line ending in `*`) followed a line ending in `.`/`;`/`:`
+without a blank line, most of them missed stanza breaks. With `hocr-text`
+those counts are 14 and 23; the latter includes false alarms, where a
+half-verse wraps onto a second line. Most of what remains comes from OCR
+errors (a stray `*`, a junk line) or skewed, dirty pages.
 Pages 1 and 3 are blank (cover versos); page 2 is the title, 4 the preface,
 5 the reprint notice, 6 onwards the psalms, followed by the nine biblical
 canticles.

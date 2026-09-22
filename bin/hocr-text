@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+hocr-text - turn Tesseract hOCR into plain text, placing blank lines by
+geometry instead of by Tesseract's paragraph detection.
+
+Tesseract's own text output separates "paragraphs" with a blank line, but
+its paragraph finder is easily fooled by verse: a stanza break goes missing
+here, a blank line appears in the middle of a verse there. The hOCR output
+records where every line sits on the page, and the stanza breaks are plain
+to see in it: on a page with an 80 px line pitch, consecutive lines of a
+verse are ~80 px apart and a new stanza starts ~120 px down.
+
+For every pair of consecutive lines the vertical distance is the distance
+between their baselines, taken at a common x so that a slightly rotated
+page does not skew it. Where Tesseract's baseline fit looks wrong for
+either line, it is the median of the top-edge, baseline and bottom-edge
+distances instead, so that one bad measurement is outvoted. The page's
+normal line pitch is the 30th percentile of those distances (most gaps on
+a page are ordinary line feeds). A blank line is written wherever the
+distance exceeds FACTOR x pitch, and wherever the reading order jumps back
+up the page (a new column or block). Pages with too few lines for a pitch,
+or with an implausibly small one (lines broken into fragments on a bad
+scan), use the median pitch of all pages given.
+
+The words and lines are exactly Tesseract's; only the blank lines differ.
+
+Usage: hocr-text [-g FACTOR] FILE.hocr                 # text to stdout
+       hocr-text [-g FACTOR] -o DIR FILE.hocr ...      # DIR/<name>.txt each
+       hocr-text [-g FACTOR] -d FILE.hocr ...          # show gaps and decisions
+
+  -g FACTOR  a gap larger than FACTOR x the line pitch is a paragraph break
+             [1.25]
+  -o DIR     write one DIR/<basename>.txt per input file
+  -d         debug: print every line with its gap, the pitch and the verdict
+"""
+
+import getopt
+import os
+import re
+import statistics
+import sys
+from html.parser import HTMLParser
+
+LINE_CLASSES = {"ocr_line", "ocr_header", "ocr_caption", "ocr_textfloat"}
+MIN_GAPS_FOR_PAGE_PITCH = 6
+
+
+class Line:
+    def __init__(self, title):
+        props = dict(p.strip().split(" ", 1) for p in title.split(";") if " " in p.strip())
+        self.x0, self.top, self.x1, self.bottom = map(int, props["bbox"].split())
+        slope, offset = (props.get("baseline") or "0 0").split()
+        self.slope, self.offset = float(slope), float(offset)
+        self.words = []
+
+    def base(self, x):
+        """hOCR baseline: y = y1 + offset + slope * (x - x0)."""
+        return self.bottom + self.offset + self.slope * (x - self.x0)
+
+    def text(self):
+        return " ".join(w for w in self.words if w)
+
+
+class HocrParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.lines = []
+        self.stack = []  # per open element: "line", "word" or None
+        self.word = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        classes = set((a.get("class") or "").split())
+        kind = None
+        if classes & LINE_CLASSES:
+            self.lines.append(Line(a.get("title", "")))
+            kind = "line"
+        elif "ocrx_word" in classes and self.lines:
+            self.word = []
+            kind = "word"
+        self.stack.append(kind)
+
+    def handle_startendtag(self, tag, attrs):
+        pass  # <br/>, <meta/>: no content
+
+    def handle_endtag(self, tag):
+        if not self.stack:
+            return
+        if self.stack.pop() == "word":
+            self.lines[-1].words.append("".join(self.word).strip())
+            self.word = None
+
+    def handle_data(self, data):
+        if self.word is not None:
+            self.word.append(data)
+
+
+def read_lines(path):
+    p = HocrParser()
+    with open(path, encoding="utf-8") as f:
+        p.feed(f.read())
+    return [l for l in p.lines if l.text()]
+
+
+def gaps(lines):
+    """Vertical distance from each line to the next.
+
+    Preferably the distance between the two baselines, measured at a common
+    x so that a slightly rotated page does not skew it. Tesseract's baseline
+    fit is occasionally off, though (slope unlike the rest of the page, or
+    the line lying outside its own box); if either line's fit looks wrong,
+    use the median of the top, baseline and bottom distances instead.
+    """
+    if not lines:
+        return []
+    page_slope = statistics.median(l.slope for l in lines)
+
+    def sane(l):
+        return (abs(l.slope - page_slope) < 0.006
+                and l.top <= l.base((l.x0 + l.x1) / 2) <= l.bottom)
+
+    out = []
+    for a, b in zip(lines, lines[1:]):
+        x = (max(a.x0, b.x0) + min(a.x1, b.x1)) / 2
+        d = b.base(x) - a.base(x)
+        if not (sane(a) and sane(b)):
+            d = statistics.median([b.top - a.top, d, b.bottom - a.bottom])
+        out.append(d)
+    return out
+
+
+def page_pitch(g):
+    g = sorted(x for x in g if x > 0)
+    if len(g) < MIN_GAPS_FOR_PAGE_PITCH:
+        return None
+    return g[int(len(g) * 0.3)]
+
+
+def render(lines, pitch, factor, debug=False):
+    out = []
+    g = gaps(lines)
+    for i, line in enumerate(lines):
+        verdict = ""
+        if i:
+            d = g[i - 1]
+            brk = pitch is not None and (d < 0 or d > factor * pitch)
+            if brk:
+                out.append("")
+            verdict = f"{d:7.1f} {'BREAK' if brk else '':5} "
+        out.append(f"{verdict:14}| {line.text()}" if debug else line.text())
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def main():
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "g:o:dh")
+    except getopt.GetoptError as e:
+        sys.exit(f"hocr-text: {e}")
+    factor, outdir, debug = 1.25, None, False
+    for o, v in opts:
+        if o == "-g":
+            factor = float(v)
+        elif o == "-o":
+            outdir = v
+        elif o == "-d":
+            debug = True
+        elif o == "-h":
+            print(__doc__.strip())
+            return
+    if not args or (len(args) > 1 and not (outdir or debug)):
+        sys.exit("usage: hocr-text [-g FACTOR] [-o DIR | -d] FILE.hocr ...  (-h for help)")
+
+    pages = [(path, read_lines(path)) for path in args]
+    pitches = {path: page_pitch(gaps(lines)) for path, lines in pages}
+    known = [p for p in pitches.values() if p is not None]
+    fallback = statistics.median(known) if known else None
+
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+    for path, lines in pages:
+        pitch = pitches[path]
+        if fallback and (pitch is None or pitch < 0.75 * fallback):
+            # Too few lines, or lines broken into fragments (a bad scan).
+            pitch = fallback
+        if pitch is None and len(lines) > 1:
+            # A single short page: guess the pitch from the smallest gap.
+            pitch = min((x for x in gaps(lines) if x > 0), default=None)
+        text = render(lines, pitch, factor, debug)
+        if debug:
+            print(f"=== {path}: pitch {pitch:.0f}{'' if pitch == pitches[path] else ' (fallback)'}")
+            sys.stdout.write(text)
+        elif outdir:
+            name = re.sub(r"\.hocr$", "", os.path.basename(path)) + ".txt"
+            with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
